@@ -80,6 +80,12 @@ A more complete configuration showing all available options:
   ;; Preview window
   (setq grease-preview-window-width 0.4) ; Preview takes 40% of frame width
   (setq grease-preview-writable nil)     ; Set to t to make file previews editable
+
+  ;; Confirmations
+  (setq grease-skip-confirm-for-simple-edits nil)
+  ;; When set to t, saves simple edits without asking first.
+  ;; Simple edits: no deletes, up to 5 creates, up to 1 copy,
+  ;; and up to 1 move/rename on the same local/remote filesystem.
   )
 #+end_src
 

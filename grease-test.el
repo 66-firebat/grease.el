@@ -842,5 +842,59 @@
           (when (buffer-live-p buf)
             (kill-buffer buf)))))))
 
+(ert-deftest grease-test-simple-edit-rules ()
+  "Test Oil-style simple edit classification."
+  (let ((grease--root-dir "/tmp/grease-test/"))
+    (should (grease--simple-edit-p '((:create "/tmp/grease-test/a")
+                                     (:create "/tmp/grease-test/b")
+                                     (:copy "/tmp/grease-test/a" "/tmp/grease-test/a-copy")
+                                     (:rename "/tmp/grease-test/old" "/tmp/grease-test/new"))))
+    (should-not (grease--simple-edit-p '((:delete "/tmp/grease-test/a"))))
+    (should-not (grease--simple-edit-p '((:create "/tmp/grease-test/a")
+                                         (:create "/tmp/grease-test/b")
+                                         (:create "/tmp/grease-test/c")
+                                         (:create "/tmp/grease-test/d")
+                                         (:create "/tmp/grease-test/e")
+                                         (:create "/tmp/grease-test/f"))))
+    (should-not (grease--simple-edit-p '((:copy "/tmp/grease-test/a" "/tmp/grease-test/a-copy")
+                                         (:copy "/tmp/grease-test/b" "/tmp/grease-test/b-copy"))))
+    (should-not (grease--simple-edit-p '((:move "/tmp/grease-test/a" "/tmp/grease-test/b")
+                                         (:rename "/tmp/grease-test/c" "/tmp/grease-test/d"))))))
+
+(ert-deftest grease-test-save-simple-edit-skips-confirm-when-enabled ()
+  "Simple edits should save without prompting when configured."
+  (grease-test-with-temp-dir
+    (grease-test-with-buffer temp-dir
+      (let ((grease-skip-confirm-for-simple-edits t)
+            (new-file (expand-file-name "quick.txt" temp-dir)))
+        (goto-char (point-max))
+        (forward-line -1)
+        (let ((inhibit-read-only t))
+          (insert "quick.txt"))
+        (cl-letf (((symbol-function 'read-char-choice)
+                   (lambda (&rest _)
+                     (error "Should not prompt for simple edits"))))
+          (should (grease-save)))
+        (should (file-exists-p new-file))))))
+
+(ert-deftest grease-test-save-complex-edit-still-prompts-when-simple-skip-enabled ()
+  "Deletes should still prompt even when simple edit confirmation is skipped."
+  (grease-test-with-temp-dir
+    (write-region "" nil (expand-file-name "deleteme.txt" temp-dir))
+    (grease-test-with-buffer temp-dir
+      (let ((grease-skip-confirm-for-simple-edits t)
+            (prompted nil))
+        (goto-char (point-min))
+        (forward-line 1)
+        (let ((inhibit-read-only t))
+          (delete-region (line-beginning-position)
+                         (min (1+ (line-end-position)) (point-max))))
+        (cl-letf (((symbol-function 'read-char-choice)
+                   (lambda (&rest _)
+                     (setq prompted t)
+                     ?n)))
+          (should-not (grease-save)))
+        (should prompted)))))
+
 (provide 'grease-test)
 ;;; grease-test.el ends here

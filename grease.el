@@ -17,7 +17,9 @@
 (eval-when-compile (require 'nerd-icons nil t))
 (eval-when-compile (require 'evil nil t))
 
-
+(defgroup grease nil
+  "Oil.nvim-style writable file manager."
+  :group 'files)
 
 ;; Enable icons by default if available
 (defvar grease-use-icons t
@@ -49,6 +51,14 @@ If non-nil, the window existed before grease and should be restored on close.")
 (defvar grease-preview-writable nil
   "When non-nil, preview buffer for files is writable.
 Does not apply to directories.")
+
+(defcustom grease-skip-confirm-for-simple-edits nil
+  "When non-nil, save simple edits without asking for confirmation.
+A simple edit has no deletes, at most five creates, at most one copy,
+and at most one move or rename.  Copies, moves, and renames must stay on
+the same local/remote filesystem adapter."
+  :type 'boolean
+  :group 'grease)
 
 ;;;; Sorting Configuration
 
@@ -1279,6 +1289,43 @@ Runs BEFORE Evil's delete (which will also yank)."
              (grease--relative-path src)
              (grease--relative-path dst)))))
 
+(defun grease--same-filesystem-adapter-p (src dst)
+  "Return non-nil when SRC and DST use the same local/remote adapter."
+  (equal (file-remote-p src) (file-remote-p dst)))
+
+(defun grease--simple-edit-p (changes)
+  "Return non-nil if CHANGES are simple enough to skip confirmation."
+  (let ((num-create 0)
+        (num-copy 0)
+        (num-move 0)
+        (simple t))
+    (dolist (change changes)
+      (pcase change
+        (`(:delete ,_path)
+         (setq simple nil))
+        (`(:create ,_path)
+         (cl-incf num-create))
+        (`(:copy ,src ,dst)
+         (cl-incf num-copy)
+         (unless (grease--same-filesystem-adapter-p src dst)
+           (setq simple nil)))
+        (`(:move ,src ,dst)
+         (cl-incf num-move)
+         (unless (grease--same-filesystem-adapter-p src dst)
+           (setq simple nil)))
+        (`(:rename ,src ,dst)
+         (cl-incf num-move)
+         (unless (grease--same-filesystem-adapter-p src dst)
+           (setq simple nil)))))
+    (and simple
+         (<= num-create 5)
+         (<= num-copy 1)
+         (<= num-move 1))))
+
+(defun grease--should-skip-confirm-p (changes)
+  "Return non-nil when CHANGES should be applied without confirmation."
+  (and grease-skip-confirm-for-simple-edits
+       (grease--simple-edit-p changes)))
 
 
 (defun grease--detect-name-conflicts (entries)
@@ -1709,23 +1756,28 @@ be used.  Timers do not reliably run with the Grease buffer current."
           (setq grease--buffer-dirty-p nil)
           (message "Grease: No changes to save.")
           t)
-      (let* ((prompt (format "Apply these changes? (y=yes, n=cancel, d=discard)\n%s\n"
-                             (mapconcat #'grease--format-change changes "\n")))
-             (choice (read-char-choice prompt '(?y ?n ?d))))
-        (pcase choice
-          (?y
-           (grease--apply-changes changes)
-           (grease--render grease--root-dir)
-           t)
-          (?d
-           (setq grease--pending-changes nil
-                 grease--clipboard nil
-                 grease--buffer-dirty-p nil)
-           (clrhash grease--deleted-file-ids)
-           (grease--render grease--root-dir)
-           (message "Grease: Discarded all pending changes.")
-           t)
-          (_ (message "Grease: Save cancelled.") nil))))))
+      (if (grease--should-skip-confirm-p changes)
+          (progn
+            (grease--apply-changes changes)
+            (grease--render grease--root-dir)
+            t)
+        (let* ((prompt (format "Apply these changes? (y=yes, n=cancel, d=discard)\n%s\n"
+                               (mapconcat #'grease--format-change changes "\n")))
+               (choice (read-char-choice prompt '(?y ?n ?d))))
+          (pcase choice
+            (?y
+             (grease--apply-changes changes)
+             (grease--render grease--root-dir)
+             t)
+            (?d
+             (setq grease--pending-changes nil
+                   grease--clipboard nil
+                   grease--buffer-dirty-p nil)
+             (clrhash grease--deleted-file-ids)
+             (grease--render grease--root-dir)
+             (message "Grease: Discarded all pending changes.")
+             t)
+            (_ (message "Grease: Save cancelled.") nil)))))))
 
 (defun grease-duplicate-line ()
   "Duplicate the current line."
@@ -1948,21 +2000,25 @@ be used.  Timers do not reliably run with the Grease buffer current."
               ;; filesystem operation, such as blank/whitespace-only lines.
               (setq grease--buffer-dirty-p nil)
               (kill-buffer (current-buffer)))
-          (let* ((prompt (format "Save changes before quitting? (y=yes, n=cancel, d=discard)\n%s\n"
-                                 (mapconcat #'grease--format-change changes "\n")))
-                 (choice (read-char-choice prompt '(?y ?n ?d))))
-            (pcase choice
-              (?y
-               (grease-save)
-               (kill-buffer (current-buffer)))
-              (?d
-               (setq grease--pending-changes nil
-                     grease--clipboard nil
-                     grease--buffer-dirty-p nil)
-               (clrhash grease--deleted-file-ids)
-               (kill-buffer (current-buffer))
-               (message "Grease: Discarded changes and quit."))
-              (_ (message "Quit cancelled."))))))
+          (if (grease--should-skip-confirm-p changes)
+              (progn
+                (grease-save)
+                (kill-buffer (current-buffer)))
+            (let* ((prompt (format "Save changes before quitting? (y=yes, n=cancel, d=discard)\n%s\n"
+                                   (mapconcat #'grease--format-change changes "\n")))
+                   (choice (read-char-choice prompt '(?y ?n ?d))))
+              (pcase choice
+                (?y
+                 (grease-save)
+                 (kill-buffer (current-buffer)))
+                (?d
+                 (setq grease--pending-changes nil
+                       grease--clipboard nil
+                       grease--buffer-dirty-p nil)
+                 (clrhash grease--deleted-file-ids)
+                 (kill-buffer (current-buffer))
+                 (message "Grease: Discarded changes and quit."))
+                (_ (message "Quit cancelled.")))))))
     (kill-buffer (current-buffer))))
 
 ;;;; Major Mode Definition
