@@ -808,5 +808,39 @@
         (should-not (plist-get pasted :source-id))
         (should-not (plist-get pasted :is-duplicate))))))
 
+(ert-deftest grease-test-save-whitespace-only-is-clean ()
+  "Whitespace-only dirty state should save as no-op success."
+  (grease-test-with-temp-dir
+    (grease-test-with-buffer temp-dir
+      (goto-char (point-max))
+      (let ((inhibit-read-only t))
+        (insert "   \n\t\t\n"))
+      (should grease--buffer-dirty-p)
+      (should (grease-save))
+      (should-not grease--buffer-dirty-p))))
+
+(ert-deftest grease-test-quit-whitespace-only-does-not-prompt ()
+  "Quitting after whitespace-only edits should not ask to save."
+  (grease-test-with-temp-dir
+    (grease-test-with-clean-state
+      (let ((buf (generate-new-buffer " *grease-quit-test*")))
+        (unwind-protect
+            (progn
+              (with-current-buffer buf
+                (grease-mode)
+                (setq grease--root-dir (file-name-as-directory (expand-file-name temp-dir)))
+                (grease--render grease--root-dir)
+                (goto-char (point-max))
+                (let ((inhibit-read-only t))
+                  (insert "   \n"))
+                (should grease--buffer-dirty-p)
+                (cl-letf (((symbol-function 'read-char-choice)
+                           (lambda (&rest _)
+                             (error "Should not prompt for no-op changes"))))
+                  (grease-quit)))
+              (should-not (buffer-live-p buf)))
+          (when (buffer-live-p buf)
+            (kill-buffer buf)))))))
+
 (provide 'grease-test)
 ;;; grease-test.el ends here

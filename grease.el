@@ -1701,7 +1701,14 @@ be used.  Timers do not reliably run with the Grease buffer current."
   (interactive)
   (let ((changes (grease--calculate-changes)))
     (if (not changes)
-        (message "Grease: No changes to save.")
+        (progn
+          ;; Whitespace-only edits, extra blank lines, etc. can mark the
+          ;; buffer dirty without producing any filesystem operation.
+          ;; Treat those as clean so follow-up actions (visit/quit) do not
+          ;; prompt unnecessarily.
+          (setq grease--buffer-dirty-p nil)
+          (message "Grease: No changes to save.")
+          t)
       (let* ((prompt (format "Apply these changes? (y=yes, n=cancel, d=discard)\n%s\n"
                              (mapconcat #'grease--format-change changes "\n")))
              (choice (read-char-choice prompt '(?y ?n ?d))))
@@ -1917,37 +1924,45 @@ be used.  Timers do not reliably run with the Grease buffer current."
 (defun grease-refresh ()
   "Discard all changes and reload the directory from disk."
   (interactive)
-  (if (and grease--buffer-dirty-p
-           (not (y-or-n-p "Discard all uncommitted changes?")))
-      (message "Refresh cancelled.")
-    (setq grease--pending-changes nil)
-    (setq grease--clipboard nil)
-    (clrhash grease--deleted-file-ids)
-    ;; Re-scan the directory on disk
-    (grease--render grease--root-dir)
-    (message "Grease: Refreshed.")))
+  (let ((changes (and grease--buffer-dirty-p (grease--calculate-changes))))
+    (if (and changes
+             (not (y-or-n-p "Discard all uncommitted changes?")))
+        (message "Refresh cancelled.")
+      (setq grease--pending-changes nil)
+      (setq grease--clipboard nil)
+      (setq grease--buffer-dirty-p nil)
+      (clrhash grease--deleted-file-ids)
+      ;; Re-scan the directory on disk
+      (grease--render grease--root-dir)
+      (message "Grease: Refreshed."))))
 
 (defun grease-quit ()
   "Quit the grease buffer, prompting to save or discard changes."
   (interactive)
   (grease--save-position)
   (if (or grease--buffer-dirty-p grease--pending-changes)
-      (let* ((changes (grease--calculate-changes))
-             (prompt (format "Save changes before quitting? (y=yes, n=cancel, d=discard)\n%s\n"
-                             (mapconcat #'grease--format-change changes "\n")))
-             (choice (read-char-choice prompt '(?y ?n ?d))))
-        (pcase choice
-          (?y
-           (grease-save)
-           (kill-buffer (current-buffer)))
-          (?d
-           (setq grease--pending-changes nil
-                 grease--clipboard nil
-                 grease--buffer-dirty-p nil)
-           (clrhash grease--deleted-file-ids)
-           (kill-buffer (current-buffer))
-           (message "Grease: Discarded changes and quit."))
-          (_ (message "Quit cancelled."))))
+      (let ((changes (grease--calculate-changes)))
+        (if (not changes)
+            (progn
+              ;; Ignore dirty state caused by edits that do not map to any
+              ;; filesystem operation, such as blank/whitespace-only lines.
+              (setq grease--buffer-dirty-p nil)
+              (kill-buffer (current-buffer)))
+          (let* ((prompt (format "Save changes before quitting? (y=yes, n=cancel, d=discard)\n%s\n"
+                                 (mapconcat #'grease--format-change changes "\n")))
+                 (choice (read-char-choice prompt '(?y ?n ?d))))
+            (pcase choice
+              (?y
+               (grease-save)
+               (kill-buffer (current-buffer)))
+              (?d
+               (setq grease--pending-changes nil
+                     grease--clipboard nil
+                     grease--buffer-dirty-p nil)
+               (clrhash grease--deleted-file-ids)
+               (kill-buffer (current-buffer))
+               (message "Grease: Discarded changes and quit."))
+              (_ (message "Quit cancelled."))))))
     (kill-buffer (current-buffer))))
 
 ;;;; Major Mode Definition
