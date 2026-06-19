@@ -191,6 +191,16 @@ If ID is provided, use that ID instead of generating a new one."
              grease--file-registry)
     file-id))
 
+(defun grease--refresh-file-registration (id path type)
+  "Refresh registry entry ID with current PATH, TYPE, and filesystem existence."
+  (when id
+    (puthash id
+             (list :path (expand-file-name path)
+                   :type type
+                   :exists (file-exists-p path))
+             grease--file-registry)
+    id))
+
 (defun grease--mark-file-deleted (id path)
   "Mark file with ID at PATH as deleted."
   (let ((entry (gethash id grease--file-registry)))
@@ -252,8 +262,10 @@ If ID is provided, use that ID instead of generating a new one."
           (let* ((abs-path (expand-file-name file abs-dir))
                  (type (if (file-directory-p abs-path) 'dir 'file))
                  (existing-id (grease--get-id-by-path abs-path)))
-            ;; Only register if not already in registry
-            (unless existing-id
+            ;; Register new entries and refresh existing entries, since pending
+            ;; creates can become real filesystem entries after save.
+            (if existing-id
+                (grease--refresh-file-registration existing-id abs-path type)
               (grease--register-file abs-path type))))))))
 
 ;;;; Core Helpers
@@ -293,6 +305,15 @@ matching bugs (e.g., directory 'gobe' matching 'go' pattern)."
 (defun grease--get-full-path (name)
   "Get full path for NAME in current directory."
   (expand-file-name (grease--strip-trailing-slash name) grease--root-dir))
+
+(defun grease--get-create-path (name type)
+  "Get full creation path for NAME and TYPE in current directory.
+Directory creation paths keep a trailing slash so `grease--apply-changes'
+creates a directory rather than an empty file."
+  (let ((path (grease--get-full-path name)))
+    (if (eq type 'dir)
+        (file-name-as-directory path)
+      path)))
 
 (defun grease--format-id (id)
   "Format ID as a 3-digit string with leading zeroes."
@@ -656,6 +677,8 @@ If target exceeds available files, go to last file line."
           (unless (and existing-id
                        (gethash existing-id grease--deleted-file-ids))
             (puthash (grease--normalize-name file type) type grease--original-state)
+            (when existing-id
+              (grease--refresh-file-registration existing-id abs-path type))
             (grease--insert-entry
              (or existing-id (cl-incf grease--session-id-counter))
              file type nil nil)))))
@@ -1428,7 +1451,7 @@ Returns a list of rename operations to be performed."
                  (dst-path (grease--get-full-path name)))
             (if (and source-path (grease--real-file-id-p source-id))
                 (push `(:copy ,source-path ,dst-path) changes)
-              (push `(:create ,dst-path) changes))))
+              (push `(:create ,(grease--get-create-path name type)) changes))))
 
          ;; Case 2: A duplicated line within the same directory
          (is-duplicate
@@ -1446,7 +1469,7 @@ Returns a list of rename operations to be performed."
             (when source-entry
               (if (and source-path (grease--real-file-id-p source-entry-id))
                   (push `(:copy ,source-path ,dst-path) changes)
-                (push `(:create ,dst-path) changes)))))
+                (push `(:create ,(grease--get-create-path name type)) changes)))))
 
          ;; Case 3: Was this file previously deleted and moved here?
          ((and id (gethash id grease--deleted-file-ids))
@@ -1456,13 +1479,13 @@ Returns a list of rename operations to be performed."
               ;; This is a moved file - add as move operation
               (push `(:move ,src-path ,dst-path) changes))))
 
-         ;; Case 4: A newly created file
+         ;; Case 4: A newly created file or directory
          (is-new
-          (push `(:create ,(grease--get-full-path name)) changes))
+          (push `(:create ,(grease--get-create-path name type)) changes))
 
-         ;; Case 6: New file that doesn't match original state and isn't a rename
+         ;; Case 6: New file/directory that doesn't match original state and isn't a rename
          ((not (gethash name original-files))
-          (push `(:create ,(grease--get-full-path name)) changes)))))
+          (push `(:create ,(grease--get-create-path name type)) changes)))))
 
     ;; Process deletions - any original file not seen in the current buffer
     (maphash (lambda (name type)

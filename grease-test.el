@@ -799,6 +799,51 @@
                                 changes))))
           (should-not (cl-find-if (lambda (c) (eq (car c) :copy)) changes)))))))
 
+(ert-deftest grease-test-newly-created-directory-copy-pastes-as-filesystem-copy ()
+  "A directory created in-session should copy as a real directory after save/render."
+  (grease-test-with-temp-dir
+    (grease-test-with-buffer temp-dir
+      (goto-char (point-max))
+      (let ((inhibit-read-only t))
+        (insert "test/\n"))
+      (let ((create-changes (grease--calculate-changes)))
+        (grease--apply-changes create-changes))
+      (grease--render grease--root-dir)
+      (goto-char (point-min))
+      (forward-line 1)
+      (grease-copy)
+      (grease-paste)
+      (let ((copy-changes (grease--calculate-changes)))
+        (should (cl-find-if
+                 (lambda (c)
+                   (and (eq (car c) :copy)
+                        (string-suffix-p "test" (nth 1 c))
+                        (string-suffix-p "test-copy" (nth 2 c))))
+                 copy-changes))
+        (should-not (cl-find-if
+                     (lambda (c)
+                       (and (eq (car c) :create)
+                            (string-suffix-p "test-copy/" (cadr c))))
+                     copy-changes))))))
+
+(ert-deftest grease-test-renamed-pending-directory-creates-directory ()
+  "A pending directory line with a changed name still creates a directory."
+  (grease-test-with-temp-dir
+    (grease-test-with-buffer temp-dir
+      (goto-char (point-max))
+      (let ((id (grease--get-next-id)))
+        ;; Simulate a duplicated pending directory that has been manually
+        ;; renamed from test/ to test1/ before commit.
+        (grease--insert-entry id "test1/" 'dir nil nil))
+      (let ((changes (grease--calculate-changes)))
+        (should (cl-find-if
+                 (lambda (c)
+                   (and (eq (car c) :create)
+                        (string-suffix-p "test1/" (cadr c))))
+                 changes))
+        (grease--apply-changes changes))
+      (should (file-directory-p (expand-file-name "test1" temp-dir))))))
+
 (ert-deftest grease-test-copy-pending-new-line-pastes-as-text-create ()
   "Pasting a copied pending line should not keep a copy source-id."
   (grease-test-with-temp-dir
