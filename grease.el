@@ -1628,6 +1628,130 @@ paths or authoritative states signal `user-error' before any mutation."
             :baseline baseline
             :entries desired-entries))))
 
+(defun grease--operation-destination (operation)
+  "Return OPERATION's destination path, if it has one."
+  (pcase (plist-get operation :kind)
+    ((or 'create 'copy 'relocate) (plist-get operation :dst))))
+
+(defun grease--path-occupied-p (path)
+  "Return non-nil when PATH names an existing entry or symbolic link."
+  (or (file-exists-p path) (file-symlink-p path)))
+
+(defun grease--plan-transaction (semantic-operations)
+  "Validate and safely order acyclic SEMANTIC-OPERATIONS.
+Return a new operation list.  Cyclic relocation dependencies are rejected for
+now; the cycle-breaking phase will handle them in the next milestone."
+  (let* ((operations (copy-tree semantic-operations))
+         (sources (make-hash-table :test 'equal))
+         (destinations (make-hash-table :test 'equal))
+         (creates (make-hash-table :test 'equal))
+         (dependencies (make-hash-table :test 'eq)))
+    (cl-labels
+        ((add-dependency
+          (operation prerequisite)
+          (unless (eq operation prerequisite)
+            (cl-pushnew prerequisite (gethash operation dependencies)
+                        :test #'eq)))
+         (provider-for-directory
+          (directory)
+          (or (gethash directory creates)
+              (cl-find-if
+               (lambda (operation)
+                 (and (eq (plist-get operation :kind) 'relocate)
+                      (eq (plist-get operation :type) 'dir)
+                      (equal (plist-get operation :dst) directory)))
+               operations))))
+
+      ;; Index paths and reject malformed or ambiguous operations first.
+      (dolist (operation operations)
+        (let ((kind (plist-get operation :kind))
+              (src (plist-get operation :src))
+              (dst (grease--operation-destination operation)))
+          (unless (memq kind '(create copy relocate delete))
+            (user-error "Unknown filesystem operation kind %S" kind))
+          (when (memq kind '(copy relocate delete))
+            (unless src
+              (user-error "Operation %S has no source" operation)))
+          (when (memq kind '(relocate delete))
+            (when (gethash src sources)
+              (user-error "Multiple operations consume source %s" src))
+            (puthash src operation sources))
+          (when dst
+            (when (gethash dst destinations)
+              (user-error "Multiple operations claim destination %s" dst))
+            (puthash dst operation destinations))
+          (when (eq kind 'create)
+            (puthash dst operation creates))
+          (when (and (eq kind 'relocate)
+                     (eq (plist-get operation :type) 'dir)
+                     (or (equal src dst)
+                         (file-in-directory-p dst
+                                              (file-name-as-directory src))))
+            (user-error "Cannot relocate directory %s into itself" src))))
+
+      ;; Reject ambiguous edits below a directory that is itself relocating.
+      (dolist (ancestor operations)
+        (when (and (eq (plist-get ancestor :kind) 'relocate)
+                   (eq (plist-get ancestor :type) 'dir))
+          (let ((ancestor-src (file-name-as-directory
+                               (plist-get ancestor :src))))
+            (dolist (operation operations)
+              (unless (eq ancestor operation)
+                (when (cl-some
+                       (lambda (path)
+                         (and path (file-in-directory-p path ancestor-src)))
+                       (list (plist-get operation :src)
+                             (grease--operation-destination operation)))
+                  (user-error
+                   "Overlapping transaction below relocated directory %s"
+                   (plist-get ancestor :src))))))))
+
+      (dolist (operation operations)
+        (let* ((kind (plist-get operation :kind))
+               (src (plist-get operation :src))
+               (dst (grease--operation-destination operation))
+               (blocker (and dst (gethash dst sources))))
+          ;; Existing destinations must be vacated or explicitly deleted.
+          (when (and dst (grease--path-occupied-p dst))
+            (unless (and blocker
+                         (memq (plist-get blocker :kind) '(relocate delete)))
+              (user-error "Destination is occupied outside transaction: %s" dst)))
+          (when blocker
+            (add-dependency operation blocker))
+
+          ;; Destination parents must exist or be produced first.
+          (when dst
+            (let ((parent (directory-file-name (file-name-directory dst))))
+              (unless (or (file-directory-p parent)
+                          (equal parent dst))
+                (let ((provider (provider-for-directory parent)))
+                  (unless provider
+                    (user-error "Destination parent does not exist: %s" parent))
+                  (add-dependency operation provider)))))
+
+          ;; Copies must read their source before another operation consumes it.
+          (when (eq kind 'copy)
+            (dolist (consumer operations)
+              (when (and (not (eq operation consumer))
+                         (equal src (plist-get consumer :src))
+                         (memq (plist-get consumer :kind) '(relocate delete)))
+                (add-dependency consumer operation))))))
+
+      ;; Stable topological sort.  No filesystem mutation occurs in planning.
+      (let ((remaining (copy-sequence operations))
+            ordered)
+        (while remaining
+          (let ((ready (cl-find-if
+                        (lambda (operation)
+                          (not (cl-intersection (gethash operation dependencies)
+                                                remaining :test #'eq)))
+                        remaining)))
+            (unless ready
+              (user-error "Cyclic filesystem operation dependency"))
+            (setq remaining (delq ready remaining))
+            (push ready ordered)))
+        (nreverse ordered)))))
+
 (defun grease--apply-changes (changes)
   "Apply CHANGES to the filesystem."
   (let ((errors '()))

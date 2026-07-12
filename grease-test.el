@@ -922,6 +922,125 @@ Each entry is a plist with `:path' and `:type'.  Directory entries use type
       (should-not (grease--collect-buffer-state (current-buffer)))
       (should-not grease--buffer-dirty-p))))
 
+;;;; Transaction Planning Tests
+
+(ert-deftest grease-test-plan-orders-relocation-chain ()
+  "A destination must be vacated before another relocation occupies it."
+  (grease-test-with-temp-dir
+    (let ((a (expand-file-name "a" temp-dir))
+          (b (expand-file-name "b" temp-dir))
+          (c (expand-file-name "c" temp-dir)))
+      (write-region "a" nil a)
+      (write-region "b" nil b)
+      (let ((plan (grease--plan-transaction
+                   `((:kind relocate :id 1 :src ,a :dst ,b :type file)
+                     (:kind relocate :id 2 :src ,b :dst ,c :type file)))))
+        (should (equal (mapcar (lambda (operation) (plist-get operation :id)) plan)
+                       '(2 1)))))))
+
+(ert-deftest grease-test-plan-orders-copy-before-source-relocation ()
+  "Copies must run before their source is relocated."
+  (grease-test-with-temp-dir
+    (let ((source (expand-file-name "source" temp-dir))
+          (copy (expand-file-name "copy" temp-dir))
+          (moved (expand-file-name "moved" temp-dir)))
+      (write-region "content" nil source)
+      (let ((plan (grease--plan-transaction
+                   `((:kind relocate :id 1 :src ,source :dst ,moved :type file)
+                     (:kind copy :id 2 :source-id 1 :src ,source
+                            :dst ,copy :type file)))))
+        (should (equal (mapcar (lambda (operation) (plist-get operation :kind)) plan)
+                       '(copy relocate)))))))
+
+(ert-deftest grease-test-plan-orders-delete-before-reuse ()
+  "An explicit deletion should unblock its path before relocation."
+  (grease-test-with-temp-dir
+    (let ((source (expand-file-name "source" temp-dir))
+          (target (expand-file-name "target" temp-dir)))
+      (write-region "source" nil source)
+      (write-region "target" nil target)
+      (let ((plan (grease--plan-transaction
+                   `((:kind relocate :id 1 :src ,source :dst ,target :type file)
+                     (:kind delete :id 2 :src ,target :type file)))))
+        (should (equal (mapcar (lambda (operation) (plist-get operation :kind)) plan)
+                       '(delete relocate)))))))
+
+(ert-deftest grease-test-plan-rejects-external-occupied-destination ()
+  "A destination outside the transaction must never be overwritten."
+  (grease-test-with-temp-dir
+    (let ((source (expand-file-name "source" temp-dir))
+          (target (expand-file-name "occupied" temp-dir)))
+      (write-region "source" nil source)
+      (write-region "external" nil target)
+      (should-error
+       (grease--plan-transaction
+        `((:kind relocate :id 1 :src ,source :dst ,target :type file)))
+       :type 'user-error))))
+
+(ert-deftest grease-test-plan-detects-hidden-occupied-destination ()
+  "Hidden destination entries should still block a transaction."
+  (grease-test-with-temp-dir
+    (let ((source (expand-file-name "source" temp-dir))
+          (target (expand-file-name ".hidden" temp-dir)))
+      (write-region "source" nil source)
+      (write-region "hidden" nil target)
+      (should-error
+       (grease--plan-transaction
+        `((:kind relocate :id 1 :src ,source :dst ,target :type file)))
+       :type 'user-error))))
+
+(ert-deftest grease-test-plan-rejects-duplicate-destination ()
+  "Planning should reject two operations with the same destination."
+  (grease-test-with-temp-dir
+    (let ((a (expand-file-name "a" temp-dir))
+          (b (expand-file-name "b" temp-dir))
+          (target (expand-file-name "target" temp-dir)))
+      (write-region "a" nil a)
+      (write-region "b" nil b)
+      (should-error
+       (grease--plan-transaction
+        `((:kind relocate :id 1 :src ,a :dst ,target :type file)
+          (:kind relocate :id 2 :src ,b :dst ,target :type file)))
+       :type 'user-error))))
+
+(ert-deftest grease-test-plan-rejects-directory-into-itself ()
+  "A directory cannot be relocated beneath itself."
+  (grease-test-with-temp-dir
+    (let* ((source (expand-file-name "dir" temp-dir))
+           (target (expand-file-name "dir/child/new" temp-dir)))
+      (make-directory source)
+      (should-error
+       (grease--plan-transaction
+        `((:kind relocate :id 1 :src ,source :dst ,target :type dir)))
+       :type 'user-error))))
+
+(ert-deftest grease-test-plan-orders-parent-directory-creation ()
+  "A scheduled parent directory should be created before its child."
+  (grease-test-with-temp-dir
+    (let ((parent (expand-file-name "parent" temp-dir))
+          (child (expand-file-name "parent/child.txt" temp-dir)))
+      (let ((plan (grease--plan-transaction
+                   `((:kind create :id 2 :dst ,child :type file)
+                     (:kind create :id 1 :dst ,parent :type dir)))))
+        (should (equal (mapcar (lambda (operation) (plist-get operation :id)) plan)
+                       '(1 2)))))))
+
+(ert-deftest grease-test-plan-validation-performs-zero-mutations ()
+  "A validation failure must occur before any filesystem operation."
+  (grease-test-with-temp-dir
+    (let ((source (expand-file-name "source" temp-dir))
+          (target (expand-file-name "target" temp-dir))
+          (mutations 0))
+      (write-region "source" nil source)
+      (write-region "occupied" nil target)
+      (cl-letf (((symbol-function 'grease--apply-changes)
+                 (lambda (&rest _) (cl-incf mutations))))
+        (should-error
+         (grease--plan-transaction
+          `((:kind relocate :id 1 :src ,source :dst ,target :type file)))
+         :type 'user-error))
+      (should (= mutations 0)))))
+
 ;;;; Clipboard Tests
 
 (ert-deftest grease-test-clipboard-copy ()
