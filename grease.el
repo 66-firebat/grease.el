@@ -2680,6 +2680,41 @@ not display or select the returned buffer."
         (when (buffer-live-p buffer)
           (kill-buffer buffer))))))
 
+(defvar grease--splitting-window-p nil
+  "Non-nil while a Grease command performs its own managed split.")
+
+(defun grease--advice-split-window (original-function &rest arguments)
+  "Make direct calls to ORIGINAL-FUNCTION Grease-aware for ARGUMENTS.
+The primitive keeps its normal selection behavior; only the buffer displayed
+in a newly split window changes when the source window displays Grease."
+  (let* ((source-window (or (car arguments) (selected-window)))
+         (source-buffer (and (window-live-p source-window)
+                             (window-buffer source-window)))
+         (grease-source-p
+          (and (not grease--splitting-window-p)
+               (buffer-live-p source-buffer)
+               (with-current-buffer source-buffer
+                 (derived-mode-p 'grease-mode))))
+         (directory
+          (and grease-source-p
+               (buffer-local-value 'grease--root-dir source-buffer)))
+         (new-window (apply original-function arguments))
+         new-buffer succeeded)
+    (if (not grease-source-p)
+        new-window
+      (unwind-protect
+          (progn
+            (setq new-buffer (grease--create-buffer directory))
+            (set-window-buffer new-window new-buffer)
+            (setq succeeded t)
+            new-window)
+        (unless succeeded
+          (when (buffer-live-p new-buffer)
+            (kill-buffer new-buffer))
+          (when (window-live-p new-window)
+            (let ((grease--deleting-window-p t))
+              (delete-window new-window))))))))
+
 (defun grease--split-window-with-new-buffer (split-function)
   "Split the selected Grease window using SPLIT-FUNCTION.
 Display a new Grease buffer for the current directory in the new window and
@@ -2692,7 +2727,8 @@ select it.  The source buffer's uncommitted text is intentionally not cloned."
          succeeded)
     (unwind-protect
         (progn
-          (setq new-window (funcall split-function))
+          (let ((grease--splitting-window-p t))
+            (setq new-window (funcall split-function)))
           (set-window-buffer new-window new-buffer)
           (select-window new-window)
           (setq succeeded t)
@@ -2849,9 +2885,9 @@ If already open, quit (saving position). Otherwise open project root."
     (apply orig-fun args)))
 
 (advice-add 'save-buffer :around #'grease-advice-save-buffer)
-;; Window managers such as Evil, Doom, and ace-window often call the primitive
-;; directly, bypassing command remapping.  This advice delegates unchanged for
-;; every non-Grease window and only adds last-view disposal for Grease buffers.
+;; Window managers often call the primitives directly, bypassing command
+;; remapping.  These advices delegate unchanged for non-Grease source windows.
+(advice-add 'split-window :around #'grease--advice-split-window)
 (advice-add 'delete-window :around #'grease--advice-delete-window)
 
 ;; Reset file registry on initial load

@@ -643,6 +643,60 @@ Each entry is a plist with `:path' and `:type'.  Directory entries use type
             (when (buffer-live-p buffer)
               (kill-buffer buffer))))))))
 
+(ert-deftest grease-test-direct-split-window-primitive-creates-new-buffer ()
+  "Direct primitive splitting should be Grease-aware without command remapping."
+  (grease-test-with-temp-dir
+    (grease-test-with-clean-state
+      (let ((source (grease--create-buffer temp-dir)) new-buffer)
+        (unwind-protect
+            (save-window-excursion
+              (delete-other-windows)
+              (switch-to-buffer source)
+              (let ((source-window (selected-window))
+                    (new-window (split-window nil nil 'right)))
+                (setq new-buffer (window-buffer new-window))
+                ;; Preserve the primitive's normal no-follow behavior.
+                (should (eq (selected-window) source-window))
+                (should-not (eq new-buffer source))
+                (with-current-buffer new-buffer
+                  (should (derived-mode-p 'grease-mode))
+                  (should (equal grease--root-dir
+                                 (file-name-as-directory
+                                  (expand-file-name temp-dir)))))))
+          (dolist (buffer (list source new-buffer))
+            (when (buffer-live-p buffer)
+              (kill-buffer buffer))))))))
+
+(ert-deftest grease-test-direct-split-wrapper-supports-zorg-follow-pattern ()
+  "A direct split wrapper followed by `other-window' should select the new Grease buffer."
+  (grease-test-with-temp-dir
+    (grease-test-with-clean-state
+      (let ((source (grease--create-buffer temp-dir)) new-buffer)
+        (unwind-protect
+            (save-window-excursion
+              (delete-other-windows)
+              (switch-to-buffer source)
+              (split-window-right)
+              (other-window 1)
+              (setq new-buffer (current-buffer))
+              (should-not (eq new-buffer source))
+              (should (derived-mode-p 'grease-mode)))
+          (dolist (buffer (list source new-buffer))
+            (when (buffer-live-p buffer)
+              (kill-buffer buffer))))))))
+
+(ert-deftest grease-test-direct-split-primitive-leaves-nongrease-behavior-unchanged ()
+  "Primitive advice should leave ordinary buffers displayed in both split windows."
+  (let ((buffer (generate-new-buffer " *nongrease-split-test*")))
+    (unwind-protect
+        (save-window-excursion
+          (delete-other-windows)
+          (switch-to-buffer buffer)
+          (let ((new-window (split-window nil nil 'right)))
+            (should (eq (window-buffer new-window) buffer))))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
+
 (ert-deftest grease-test-split-window-right-creates-new-grease-buffer ()
   "Splitting right should display and select an independent Grease buffer."
   (grease-test-with-temp-dir
@@ -754,7 +808,9 @@ Each entry is a plist with `:path' and `:type'.  Directory entries use type
         (save-window-excursion
           (delete-other-windows)
           (switch-to-buffer source)
-          (let ((other-window (split-window-right)))
+          (let ((other-window
+                 (let ((grease--splitting-window-p t))
+                   (split-window-right))))
             (set-window-buffer other-window (get-buffer-create "*scratch*"))
             (should (grease-close-window))
             (should-not (buffer-live-p source))))))))
@@ -769,7 +825,9 @@ Each entry is a plist with `:path' and `:type'.  Directory entries use type
         (save-window-excursion
           (delete-other-windows)
           (switch-to-buffer source)
-          (let ((other-window (split-window-right)))
+          (let ((other-window
+                 (let ((grease--splitting-window-p t))
+                   (split-window-right))))
             (set-window-buffer other-window (get-buffer-create "*scratch*")))
           (grease-test-edit-entry "old.txt" "new.txt")
           (cl-letf (((symbol-function 'grease-save-all-buffers)
@@ -787,7 +845,8 @@ Each entry is a plist with `:path' and `:type'.  Directory entries use type
             (save-window-excursion
               (delete-other-windows)
               (switch-to-buffer source)
-              (split-window-right)
+              (let ((grease--splitting-window-p t))
+                (split-window-right))
               (should (= 2 (length (get-buffer-window-list source nil t))))
               (should (grease-close-window))
               (should (buffer-live-p source))
@@ -805,7 +864,9 @@ Each entry is a plist with `:path' and `:type'.  Directory entries use type
             (save-window-excursion
               (delete-other-windows)
               (switch-to-buffer source)
-              (let ((other-window (split-window-right)))
+              (let ((other-window
+                     (let ((grease--splitting-window-p t))
+                       (split-window-right))))
                 (set-window-buffer other-window (get-buffer-create "*scratch*")))
               (grease-test-edit-entry "old.txt" "new.txt")
               (cl-letf (((symbol-function 'grease-save-all-buffers)
