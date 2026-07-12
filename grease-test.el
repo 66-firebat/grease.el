@@ -1201,6 +1201,35 @@ Each entry is a plist with `:path' and `:type'.  Directory entries use type
         `((:kind relocate :id 1 :src ,source :dst ,target :type dir)))
        :type 'user-error))))
 
+(ert-deftest grease-test-plan-normalizes-directory-destination-before-parent-check ()
+  "A display-style trailing slash must not make a directory its own parent."
+  (grease-test-with-temp-dir
+    (let* ((destination (file-name-as-directory
+                         (expand-file-name "test" temp-dir)))
+           (plan (grease--plan-transaction
+                  `((:kind create :id 1 :dst ,destination :type dir))))
+           (operation (car plan)))
+      (should (= 1 (length plan)))
+      (should (equal (plist-get operation :dst)
+                     (expand-file-name "test" temp-dir)))
+      (should (eq (plist-get operation :type) 'dir)))))
+
+(ert-deftest grease-test-plan-parent-check-is-consistent-for-files-and-directories ()
+  "File and directory destinations should resolve to the same real parent."
+  (grease-test-with-temp-dir
+    (let ((file-plan
+           (grease--plan-transaction
+            `((:kind create :id 1
+                     :dst ,(expand-file-name "new.txt" temp-dir) :type file))))
+          (directory-plan
+           (grease--plan-transaction
+            `((:kind create :id 2
+                     :dst ,(file-name-as-directory
+                            (expand-file-name "new-dir" temp-dir))
+                     :type dir)))))
+      (should (= 1 (length file-plan)))
+      (should (= 1 (length directory-plan))))))
+
 (ert-deftest grease-test-plan-orders-parent-directory-creation ()
   "A scheduled parent directory should be created before its child."
   (grease-test-with-temp-dir
@@ -2076,6 +2105,20 @@ Each entry is a plist with `:path' and `:type'.  Directory entries use type
             (with-current-buffer left
               (should-not (grease-save)))))
         (should prompted)))))
+
+(ert-deftest grease-test-save-typed-directory-through-full-transaction ()
+  "Typing test/ and saving should create the directory through the planner."
+  (grease-test-with-temp-dir
+    (grease-test-with-buffer temp-dir
+      (goto-char (point-max))
+      (let ((inhibit-read-only t))
+        (insert "test/\n"))
+      (let ((grease-skip-confirm-for-simple-edits t))
+        (should (grease-save)))
+      (should (file-directory-p (expand-file-name "test" temp-dir)))
+      (should-not grease--buffer-dirty-p)
+      (should (string-match-p "test/" (buffer-string)))
+      (should-not (string-match-p "test//" (buffer-string))))))
 
 (ert-deftest grease-test-save-whitespace-only-is-clean ()
   "Whitespace-only dirty state should save as no-op success."

@@ -1622,6 +1622,18 @@ paths or authoritative states signal `user-error' before any mutation."
   (pcase (plist-get operation :kind)
     ((or 'create 'copy 'relocate) (plist-get operation :dst))))
 
+(defun grease--normalize-operation-paths (semantic-operations)
+  "Return a copy of SEMANTIC-OPERATIONS with canonical source and destination paths."
+  (mapcar
+   (lambda (operation)
+     (let ((normalized (copy-tree operation)))
+       (dolist (property '(:src :dst))
+         (when-let ((path (plist-get normalized property)))
+           (setf (plist-get normalized property)
+                 (directory-file-name path))))
+       normalized))
+   semantic-operations))
+
 (defun grease--path-occupied-p (path)
   "Return non-nil when PATH names an existing entry or symbolic link."
   (or (file-exists-p path) (file-symlink-p path)))
@@ -1706,7 +1718,9 @@ RESERVED-PATHS contains every transaction source and destination."
 
 (defun grease--plan-transaction (semantic-operations)
   "Validate and safely order SEMANTIC-OPERATIONS, breaking relocation cycles."
-  (let* ((operations (grease--break-relocation-cycles semantic-operations))
+  (let* ((operations
+          (grease--break-relocation-cycles
+           (grease--normalize-operation-paths semantic-operations)))
          (sources (make-hash-table :test 'equal))
          (destinations (make-hash-table :test 'equal))
          (creates (make-hash-table :test 'equal))
@@ -1790,7 +1804,9 @@ RESERVED-PATHS contains every transaction source and destination."
 
           ;; Destination parents must exist or be produced first.
           (when dst
-            (let ((parent (directory-file-name (file-name-directory dst))))
+            (let ((parent
+                   (directory-file-name
+                    (file-name-directory (directory-file-name dst)))))
               (unless (or (file-directory-p parent)
                           (equal parent dst))
                 (let ((provider (provider-for-directory parent)))
