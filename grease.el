@@ -110,10 +110,6 @@ Each entry is keyed by unique ID and contains:
 (defvar grease--clipboard nil
   "Global clipboard for cross-directory operations.")
 
-;; Track deleted file IDs and their original paths
-(defvar grease--deleted-file-ids (make-hash-table :test 'eql)
-  "Track deleted files by ID. Value is the original path.")
-
 ;; Session-wide ID counter to ensure IDs are always unique
 (defvar grease--session-id-counter 1
   "Counter for generating unique file IDs within a session.")
@@ -213,13 +209,6 @@ If ID is provided, use that ID instead of generating a new one."
                      :exists committed-p)
                grease--file-registry))
     id))
-
-(defun grease--mark-file-deleted (id path)
-  "Stage removal of file ID from PATH without changing committed registry data."
-  (when (gethash id grease--file-registry)
-    ;; Kept temporarily for the old diff engine.  The registry remains a view
-    ;; of committed filesystem state until a transaction succeeds.
-    (puthash id path grease--deleted-file-ids)))
 
 (defun grease--get-file-by-id (id)
   "Get file info for ID from registry."
@@ -691,8 +680,7 @@ If target exceeds available files, go to last file line."
         (let* ((abs-path (expand-file-name file grease--root-dir))
                (type (if (file-directory-p abs-path) 'dir 'file))
                (existing-id (grease--get-id-by-path abs-path)))
-          (unless (and existing-id
-                       (gethash existing-id grease--deleted-file-ids))
+          (progn
             (puthash (grease--normalize-name file type) type grease--original-state)
             (when existing-id
               (grease--refresh-file-registration existing-id abs-path type)
@@ -928,8 +916,7 @@ Runs BEFORE Evil's delete (which will also yank)."
                     (push id ids)
                     (push source-kind source-kinds)
                     (push path paths)
-                    (when (eq source-kind 'file)
-                      (grease--mark-file-deleted id path)))))
+                    )))
               (forward-line 1))))
         (setq grease--clipboard
               (list :paths (nreverse paths)
@@ -964,8 +951,6 @@ Runs BEFORE Evil's delete (which will also yank)."
                         :operation 'cut))
             (setq grease--last-op-type 'cut)
             (setq grease--last-kill-index 0)
-            (when (eq source-kind 'file)
-              (grease--mark-file-deleted id path))
             (setq grease--buffer-dirty-p t)
             (message "Cut (staged): %s" name))))))))
 
@@ -2126,41 +2111,111 @@ be used.  Timers do not reliably run with the Grease buffer current."
 
 ;;;; User Commands
 
-(defun grease-save ()
-  "Save changes to the filesystem."
+(defun grease--commit-registry-operations (operations)
+  "Commit successful semantic OPERATIONS to the global identity registry."
+  (dolist (operation operations)
+    (let ((id (plist-get operation :id))
+          (kind (plist-get operation :kind)))
+      (pcase kind
+        ('delete (remhash id grease--file-registry))
+        ((or 'create 'copy 'relocate)
+         (puthash id
+                  (list :path (plist-get operation :dst)
+                        :type (plist-get operation :type)
+                        :committed-p t
+                        :source-id nil
+                        :exists t)
+                  grease--file-registry))))))
+
+(defun grease--clipboard-consumed-p (operations)
+  "Return non-nil when OPERATIONS consume the current Grease clipboard."
+  (let ((ids (plist-get grease--clipboard :ids)))
+    (and ids
+         (cl-some (lambda (operation)
+                    (or (memq (plist-get operation :id) ids)
+                        (memq (plist-get operation :source-id) ids)))
+                  operations))))
+
+(defun grease--rerender-live-buffers (buffers operations)
+  "Rerender live Grease BUFFERS after successful OPERATIONS."
+  (dolist (buffer buffers)
+    (when (buffer-live-p buffer)
+      (with-current-buffer buffer
+        (let ((root grease--root-dir))
+          (dolist (operation operations)
+            (when (and (eq (plist-get operation :kind) 'relocate)
+                       (eq (plist-get operation :type) 'dir)
+                       (equal (directory-file-name root)
+                              (directory-file-name
+                               (plist-get operation :src))))
+              (setq root (file-name-as-directory
+                          (plist-get operation :dst)))))
+          (while (and root (not (file-directory-p root)))
+            (let ((parent (file-name-directory (directory-file-name root))))
+              (setq root (unless (equal parent root) parent))))
+          (setq grease--pending-changes nil
+                grease--buffer-dirty-p nil)
+          (when root
+            (grease--render root)))))))
+
+(defun grease--discard-transaction (buffers)
+  "Discard staged state in participating BUFFERS and rerender from disk."
+  (setq grease--clipboard nil)
+  (grease--rerender-live-buffers buffers nil))
+
+;;;###autoload
+(defun grease-save-all-buffers ()
+  "Save all staged Grease-buffer changes as one filesystem transaction."
   (interactive)
-  (let ((changes (grease--calculate-changes)))
-    (if (not changes)
+  (let* ((all-buffers (grease--live-buffers))
+         (transaction (grease--build-transaction all-buffers))
+         (operations (plist-get transaction :operations))
+         (participants (plist-get transaction :buffers)))
+    (if (not operations)
         (progn
-          ;; Whitespace-only edits, extra blank lines, etc. can mark the
-          ;; buffer dirty without producing any filesystem operation.
-          ;; Treat those as clean so follow-up actions (visit/quit) do not
-          ;; prompt unnecessarily.
-          (setq grease--buffer-dirty-p nil)
           (message "Grease: No changes to save.")
           t)
-      (if (grease--should-skip-confirm-p changes)
-          (progn
-            (grease--apply-changes changes)
-            (grease--render grease--root-dir)
-            t)
-        (let* ((prompt (format "Apply these changes? (y=yes, n=cancel, d=discard)\n%s\n"
-                               (mapconcat #'grease--format-change changes "\n")))
-               (choice (read-char-choice prompt '(?y ?n ?d))))
-          (pcase choice
-            (?y
-             (grease--apply-changes changes)
-             (grease--render grease--root-dir)
-             t)
-            (?d
-             (setq grease--pending-changes nil
-                   grease--clipboard nil
-                   grease--buffer-dirty-p nil)
-             (clrhash grease--deleted-file-ids)
-             (grease--render grease--root-dir)
-             (message "Grease: Discarded all pending changes.")
-             t)
-            (_ (message "Grease: Save cancelled.") nil)))))))
+      (let* ((plan (grease--plan-transaction operations))
+             (display-changes
+              (mapcar #'grease--semantic-operation-to-legacy operations))
+             (choice
+              (if (grease--should-skip-confirm-p display-changes)
+                  ?y
+                (read-char-choice
+                 (format
+                  (concat "Apply all staged Grease-buffer changes? "
+                          "(y=yes, n=cancel, d=discard all)\n%s\n")
+                  (mapconcat #'grease--format-change display-changes "\n"))
+                 '(?y ?n ?d)))))
+        (pcase choice
+          (?n
+           (message "Grease: Save cancelled; no changes were applied.")
+           nil)
+          (?d
+           (grease--discard-transaction participants)
+           (message "Grease: Discarded changes from all participating buffers.")
+           t)
+          (?y
+           (let ((result (grease--execute-transaction plan)))
+             (if (not (plist-get result :success-p))
+                 (progn
+                   (message "Grease: Transaction failed at %S: %s"
+                            (plist-get result :operation)
+                            (error-message-string (plist-get result :error)))
+                   nil)
+               (let ((clipboard-consumed
+                      (grease--clipboard-consumed-p operations)))
+                 (grease--commit-registry-operations operations)
+                 (when clipboard-consumed
+                   (setq grease--clipboard nil))
+                 (grease--rerender-live-buffers all-buffers operations)
+                 (message "Grease: Transaction committed successfully.")
+                 t)))))))))
+
+(defun grease-save ()
+  "Delegate saving to `grease-save-all-buffers'."
+  (interactive)
+  (grease-save-all-buffers))
 
 (defun grease-duplicate-line ()
   "Duplicate the current line."
@@ -2204,12 +2259,8 @@ be used.  Timers do not reliably run with the Grease buffer current."
         (setq grease--last-op-type 'cut)
         (setq grease--last-kill-index 0)
 
-        ;; Mark existing files as deleted by ID.  Pending/new entries do not
-        ;; exist on disk yet, so cutting them is just text movement.
-        (when (and id (grease--line-data-real-file-p data))
-          (grease--mark-file-deleted id path))
-
-        ;; Delete the line visually
+        ;; Delete the line visually.  The committed registry remains unchanged
+        ;; until the unified transaction succeeds.
         (delete-region (line-beginning-position) (line-end-position))
         (when (eobp) (delete-char -1))
         (setq grease--buffer-dirty-p t)
@@ -2360,42 +2411,17 @@ be used.  Timers do not reliably run with the Grease buffer current."
       (setq grease--pending-changes nil)
       (setq grease--clipboard nil)
       (setq grease--buffer-dirty-p nil)
-      (clrhash grease--deleted-file-ids)
       ;; Re-scan the directory on disk
       (grease--render grease--root-dir)
       (message "Grease: Refreshed."))))
 
 (defun grease-quit ()
-  "Quit the grease buffer, prompting to save or discard changes."
+  "Quit this Grease buffer only after the unified save succeeds."
   (interactive)
   (grease--save-position)
   (if (or grease--buffer-dirty-p grease--pending-changes)
-      (let ((changes (grease--calculate-changes)))
-        (if (not changes)
-            (progn
-              ;; Ignore dirty state caused by edits that do not map to any
-              ;; filesystem operation, such as blank/whitespace-only lines.
-              (setq grease--buffer-dirty-p nil)
-              (kill-buffer (current-buffer)))
-          (if (grease--should-skip-confirm-p changes)
-              (progn
-                (grease-save)
-                (kill-buffer (current-buffer)))
-            (let* ((prompt (format "Save changes before quitting? (y=yes, n=cancel, d=discard)\n%s\n"
-                                   (mapconcat #'grease--format-change changes "\n")))
-                   (choice (read-char-choice prompt '(?y ?n ?d))))
-              (pcase choice
-                (?y
-                 (grease-save)
-                 (kill-buffer (current-buffer)))
-                (?d
-                 (setq grease--pending-changes nil
-                       grease--clipboard nil
-                       grease--buffer-dirty-p nil)
-                 (clrhash grease--deleted-file-ids)
-                 (kill-buffer (current-buffer))
-                 (message "Grease: Discarded changes and quit."))
-                (_ (message "Quit cancelled.")))))))
+      (when (grease-save-all-buffers)
+        (kill-buffer (current-buffer)))
     (kill-buffer (current-buffer))))
 
 ;;;; Major Mode Definition
@@ -2559,7 +2585,6 @@ If already open, quit (saving position). Otherwise open project root."
   (setq grease--file-registry (make-hash-table :test 'eql))
   (setq grease--visited-dirs nil)
   (setq grease--session-id-counter 1)
-  (setq grease--deleted-file-ids (make-hash-table :test 'eql))
   (message "Grease file registry reset."))
 
 ;; Add Evil leader key integration (example)
@@ -2567,16 +2592,12 @@ If already open, quit (saving position). Otherwise open project root."
   (evil-leader/set-key-for-mode 'grease-mode
     "w" 'grease-save))
 (defun grease-debug-state ()
-  "Display current global clipboard and deleted IDs for debugging."
+  "Display current global clipboard and file registry for debugging."
   (interactive)
   (with-output-to-temp-buffer "*Grease Debug*"
     (princ "=== Grease Debug State ===\n\n")
     (princ "Clipboard:\n")
     (pp grease--clipboard)
-    (princ "\nDeleted IDs:\n")
-    (maphash (lambda (id path)
-               (princ (format "  %s -> %s\n" id path)))
-             grease--deleted-file-ids)
     (princ "\nFile Registry:\n")
     (maphash (lambda (id data)
                (princ (format "  %s: %S\n" id data)))

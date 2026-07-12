@@ -25,7 +25,6 @@
   `(let ((grease--file-registry (make-hash-table :test 'eql))
          (grease--visited-dirs nil)
          (grease--session-id-counter 1)
-         (grease--deleted-file-ids (make-hash-table :test 'eql))
          (grease--clipboard nil)
          (grease--last-op-type nil)
          (grease--last-kill-index nil)
@@ -484,20 +483,6 @@ Each entry is a plist with `:path' and `:type'.  Directory entries use type
              (id (grease--register-file path 'file)))
         (should (equal (grease--get-id-by-path path) id))
         (should (null (grease--get-id-by-path "/nonexistent/path")))))))
-
-(ert-deftest grease-test-mark-file-deleted ()
-  "Test staging deletion without changing committed registry state."
-  (grease-test-with-clean-state
-    (grease-test-with-temp-dir
-      (let ((path (expand-file-name "todelete.txt" temp-dir)))
-        (write-region "content" nil path)
-        (let ((id (grease--register-file path 'file)))
-          (grease--mark-file-deleted id path)
-          (should (equal (gethash id grease--deleted-file-ids) path))
-          (let ((info (grease--get-file-by-id id)))
-            (should (plist-get info :committed-p))
-            (should (plist-get info :exists))
-            (should (equal (plist-get info :path) path))))))))
 
 (ert-deftest grease-test-baseline-is-keyed-by-stable-id ()
   "Rendering should snapshot committed entries by ID and absolute path."
@@ -1679,6 +1664,168 @@ Each entry is a plist with `:path' and `:type'.  Directory entries use type
         (should-not (plist-get pasted :source-id))
         (should-not (plist-get pasted :is-duplicate))))))
 
+;;;; Unified Save Tests
+
+(defun grease-test-save-cross-buffer-move (initiator)
+  "Run a cross-buffer move scenario, saving from INITIATOR buffer name."
+  (grease-test-with-temp-dir
+    (let ((source-dir (expand-file-name "source" temp-dir))
+          (target-dir (expand-file-name "target" temp-dir)))
+      (make-directory source-dir)
+      (make-directory target-dir)
+      (write-region "preserved-content" nil
+                    (expand-file-name "move.txt" source-dir))
+      (grease-test-with-buffers ((source source-dir) (target target-dir))
+        (grease-test-cut-and-paste source target "move.txt")
+        (let ((grease-skip-confirm-for-simple-edits t))
+          (with-current-buffer (if (eq initiator 'source) source target)
+            (should (grease-save))))
+        (should-not (file-exists-p (expand-file-name "move.txt" source-dir)))
+        (should (equal (grease-test-read-file
+                        (expand-file-name "move.txt" target-dir))
+                       "preserved-content"))
+        (should-not grease--clipboard)
+        (with-current-buffer source
+          (should-not grease--buffer-dirty-p)
+          (should-not (string-match-p "move.txt" (buffer-string))))
+        (with-current-buffer target
+          (should-not grease--buffer-dirty-p)
+          (should (string-match-p "move.txt" (buffer-string))))))))
+
+(ert-deftest grease-test-save-cross-buffer-move-from-source ()
+  "Saving from the source should commit one content-preserving move."
+  (grease-test-save-cross-buffer-move 'source))
+
+(ert-deftest grease-test-save-cross-buffer-move-from-destination ()
+  "Saving from the destination should produce the identical move result."
+  (grease-test-save-cross-buffer-move 'target))
+
+(ert-deftest grease-test-save-cross-buffer-move-has-no-later-delete ()
+  "A committed move should not leave a later source deletion transaction."
+  (grease-test-with-temp-dir
+    (let ((source-dir (expand-file-name "source" temp-dir))
+          (target-dir (expand-file-name "target" temp-dir)))
+      (make-directory source-dir)
+      (make-directory target-dir)
+      (write-region "content" nil (expand-file-name "move.txt" source-dir))
+      (grease-test-with-buffers ((source source-dir) (target target-dir))
+        (grease-test-cut-and-paste source target "move.txt")
+        (let ((grease-skip-confirm-for-simple-edits t))
+          (with-current-buffer source (should (grease-save))))
+        (should-not (plist-get (grease--build-transaction) :operations))
+        (cl-letf (((symbol-function 'read-char-choice)
+                   (lambda (&rest _) (error "No later prompt expected"))))
+          (with-current-buffer target
+            (should (grease-save))))))))
+
+(ert-deftest grease-test-save-cross-buffer-copy-preserves-source ()
+  "Unified save should commit a copy without deleting its source."
+  (grease-test-with-temp-dir
+    (let ((source-dir (expand-file-name "source" temp-dir))
+          (target-dir (expand-file-name "target" temp-dir)))
+      (make-directory source-dir)
+      (make-directory target-dir)
+      (write-region "copy-content" nil (expand-file-name "copy.txt" source-dir))
+      (grease-test-with-buffers ((source source-dir) (target target-dir))
+        (with-current-buffer source
+          (grease-test-goto-entry "copy.txt")
+          (grease-copy))
+        (with-current-buffer target
+          (goto-char (point-max))
+          (grease-paste)
+          (let ((grease-skip-confirm-for-simple-edits t))
+            (should (grease-save))))
+        (should (equal (grease-test-read-file
+                        (expand-file-name "copy.txt" source-dir))
+                       "copy-content"))
+        (should (equal (grease-test-read-file
+                        (expand-file-name "copy.txt" target-dir))
+                       "copy-content"))))))
+
+(ert-deftest grease-test-save-cancel-keeps-all-participants-dirty ()
+  "Cancelling a unified save should preserve all staged buffer state."
+  (grease-test-with-temp-dir
+    (let ((left-dir (expand-file-name "left" temp-dir))
+          (right-dir (expand-file-name "right" temp-dir)))
+      (make-directory left-dir)
+      (make-directory right-dir)
+      (write-region "left" nil (expand-file-name "left.txt" left-dir))
+      (write-region "right" nil (expand-file-name "right.txt" right-dir))
+      (grease-test-with-buffers ((left left-dir) (right right-dir))
+        (with-current-buffer left
+          (grease-test-edit-entry "left.txt" "left-new.txt"))
+        (with-current-buffer right
+          (grease-test-edit-entry "right.txt" "right-new.txt"))
+        (cl-letf (((symbol-function 'read-char-choice) (lambda (&rest _) ?n)))
+          (with-current-buffer left
+            (should-not (grease-save))))
+        (with-current-buffer left (should grease--buffer-dirty-p))
+        (with-current-buffer right (should grease--buffer-dirty-p))
+        (should (file-exists-p (expand-file-name "left.txt" left-dir)))
+        (should (file-exists-p (expand-file-name "right.txt" right-dir)))))))
+
+(ert-deftest grease-test-save-discard-rerenders-all-participants ()
+  "Discarding should clear and rerender every participating buffer."
+  (grease-test-with-temp-dir
+    (let ((left-dir (expand-file-name "left" temp-dir))
+          (right-dir (expand-file-name "right" temp-dir)))
+      (make-directory left-dir)
+      (make-directory right-dir)
+      (write-region "left" nil (expand-file-name "left.txt" left-dir))
+      (write-region "right" nil (expand-file-name "right.txt" right-dir))
+      (grease-test-with-buffers ((left left-dir) (right right-dir))
+        (with-current-buffer left
+          (grease-test-edit-entry "left.txt" "left-new.txt"))
+        (with-current-buffer right
+          (grease-test-edit-entry "right.txt" "right-new.txt"))
+        (cl-letf (((symbol-function 'read-char-choice) (lambda (&rest _) ?d)))
+          (with-current-buffer right
+            (should (grease-save))))
+        (with-current-buffer left
+          (should-not grease--buffer-dirty-p)
+          (should (string-match-p "left.txt" (buffer-string))))
+        (with-current-buffer right
+          (should-not grease--buffer-dirty-p)
+          (should (string-match-p "right.txt" (buffer-string))))))))
+
+(ert-deftest grease-test-save-execution-failure-keeps-participants-dirty ()
+  "A unified execution failure should preserve every participating state."
+  (grease-test-with-temp-dir
+    (write-region "content" nil (expand-file-name "old.txt" temp-dir))
+    (grease-test-with-buffer temp-dir
+      (grease-test-edit-entry "old.txt" "new.txt")
+      (cl-letf (((symbol-function 'grease--execute-transaction)
+                 (lambda (plan)
+                   (list :success-p nil :operation (car plan)
+                         :error '(error "injected")))))
+        (let ((grease-skip-confirm-for-simple-edits t))
+          (should-not (grease-save))))
+      (should grease--buffer-dirty-p)
+      (should (string-match-p "new.txt" (buffer-string)))
+      (should (file-exists-p (expand-file-name "old.txt" temp-dir))))))
+
+(ert-deftest grease-test-save-simple-classification-uses-combined-transaction ()
+  "Simple-edit confirmation skipping should inspect the combined transaction."
+  (grease-test-with-temp-dir
+    (let ((left-dir (expand-file-name "left" temp-dir))
+          (right-dir (expand-file-name "right" temp-dir))
+          prompted)
+      (make-directory left-dir)
+      (make-directory right-dir)
+      (write-region "left" nil (expand-file-name "left.txt" left-dir))
+      (write-region "right" nil (expand-file-name "right.txt" right-dir))
+      (grease-test-with-buffers ((left left-dir) (right right-dir))
+        (with-current-buffer left
+          (grease-test-edit-entry "left.txt" "left-new.txt"))
+        (with-current-buffer right
+          (grease-test-edit-entry "right.txt" "right-new.txt"))
+        (cl-letf (((symbol-function 'read-char-choice)
+                   (lambda (&rest _) (setq prompted t) ?n)))
+          (let ((grease-skip-confirm-for-simple-edits t))
+            (with-current-buffer left
+              (should-not (grease-save)))))
+        (should prompted)))))
+
 (ert-deftest grease-test-save-whitespace-only-is-clean ()
   "Whitespace-only dirty state should save as no-op success."
   (grease-test-with-temp-dir
@@ -1689,6 +1836,23 @@ Each entry is a plist with `:path' and `:type'.  Directory entries use type
       (should grease--buffer-dirty-p)
       (should (grease-save))
       (should-not grease--buffer-dirty-p))))
+
+(ert-deftest grease-test-quit-only-closes-after-unified-save-success ()
+  "A failed unified save should leave the requested Grease buffer open."
+  (grease-test-with-temp-dir
+    (write-region "content" nil (expand-file-name "old.txt" temp-dir))
+    (grease-test-with-buffers ((buffer temp-dir))
+      (with-current-buffer buffer
+        (grease-test-edit-entry "old.txt" "new.txt")
+        (cl-letf (((symbol-function 'grease--execute-transaction)
+                   (lambda (plan)
+                     (list :success-p nil :operation (car plan)
+                           :error '(error "injected")))))
+          (let ((grease-skip-confirm-for-simple-edits t))
+            (grease-quit))))
+      (should (buffer-live-p buffer))
+      (with-current-buffer buffer
+        (should grease--buffer-dirty-p)))))
 
 (ert-deftest grease-test-quit-whitespace-only-does-not-prompt ()
   "Quitting after whitespace-only edits should not ask to save."
