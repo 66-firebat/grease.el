@@ -42,6 +42,119 @@
        (grease--render grease--root-dir)
        ,@body)))
 
+(defun grease-test-make-buffer (dir)
+  "Create and render a Grease buffer for DIR without resetting global state."
+  (let ((buffer (generate-new-buffer " *grease-test*")))
+    (with-current-buffer buffer
+      (grease-mode)
+      (setq grease--root-dir
+            (file-name-as-directory (expand-file-name dir)))
+      (grease--render grease--root-dir))
+    buffer))
+
+(defmacro grease-test-with-buffers (bindings &rest body)
+  "Create several Grease buffers and clean them up after BODY.
+
+BINDINGS has the form ((VARIABLE DIRECTORY) ...).  All buffers share one
+fresh set of Grease global state, making this suitable for transaction tests."
+  (declare (indent 1))
+  (let ((buffers (make-symbol "buffers")))
+    `(grease-test-with-clean-state
+       (let (,@(mapcar #'car bindings) ,buffers)
+         (unwind-protect
+             (progn
+               ,@(mapcar (lambda (binding)
+                           `(setq ,(car binding)
+                                  (grease-test-make-buffer ,(cadr binding))
+                                  ,buffers (cons ,(car binding) ,buffers)))
+                         bindings)
+               ,@body)
+           (dolist (buffer ,buffers)
+             (when (buffer-live-p buffer)
+               (kill-buffer buffer))))))))
+
+(defun grease-test-goto-entry (&optional id-or-name)
+  "Move point to the entry matching ID-OR-NAME in the current buffer.
+ID-OR-NAME may be a numeric file ID or a displayed filename.  Return the
+entry data, or signal an error when no matching entry exists."
+  (goto-char (point-min))
+  (let (match)
+    (while (and (not match) (not (eobp)))
+      (let ((data (grease--get-line-data)))
+        (when (and data
+                   (if (numberp id-or-name)
+                       (equal (plist-get data :id) id-or-name)
+                     (equal (plist-get data :name) id-or-name)))
+          (setq match data)))
+      (unless match
+        (forward-line 1)))
+    (or match
+        (error "No Grease entry matching %S" id-or-name))))
+
+(defun grease-test-edit-entry (id-or-name new-name)
+  "Rename ID-OR-NAME to NEW-NAME in the current Grease buffer."
+  (let* ((data (grease-test-goto-entry id-or-name))
+         (old-name (plist-get data :name))
+         (line-end (line-end-position))
+         (inhibit-read-only t))
+    (unless (search-forward old-name line-end t)
+      (error "Cannot find entry text %S" old-name))
+    (replace-match new-name t t)
+    (grease--update-line-metadata)
+    (grease--get-line-data)))
+
+(defun grease-test-cut-and-paste (source-buffer destination-buffer id-or-name)
+  "Cut ID-OR-NAME from SOURCE-BUFFER and paste it in DESTINATION-BUFFER."
+  (with-current-buffer source-buffer
+    (grease-test-goto-entry id-or-name)
+    (grease-cut))
+  (with-current-buffer destination-buffer
+    (goto-char (point-max))
+    (grease-paste)))
+
+(defun grease-test-read-file (path)
+  "Return the literal contents of file PATH."
+  (with-temp-buffer
+    (insert-file-contents-literally path)
+    (buffer-string)))
+
+(defun grease-test-create-fixture (root entries)
+  "Create nested filesystem ENTRIES below ROOT.
+Each entry is a plist with `:path' and `:type'.  Directory entries use type
+`dir'; file entries use type `file' and may provide `:content'."
+  (dolist (entry entries)
+    (let ((path (expand-file-name (plist-get entry :path) root)))
+      (pcase (plist-get entry :type)
+        ('dir (make-directory path t))
+        ('file
+         (make-directory (file-name-directory path) t)
+         (write-region (or (plist-get entry :content) "") nil path nil 'silent))
+        (type (error "Unknown fixture type %S" type))))))
+
+(defun grease-test--canonical-operation (operation)
+  "Return a stable representation of OPERATION for test comparisons."
+  (if (and (listp operation)
+           (cl-evenp (length operation))
+           (keywordp (car operation)))
+      (let (pairs)
+        (while operation
+          (push (cons (pop operation) (pop operation)) pairs))
+        (sort pairs (lambda (left right)
+                      (string< (symbol-name (car left))
+                               (symbol-name (car right))))))
+    operation))
+
+(defun grease-test-sort-operations (operations)
+  "Canonicalize and sort OPERATIONS without relying on their input order."
+  (sort (mapcar #'grease-test--canonical-operation (copy-tree operations))
+        (lambda (left right)
+          (string< (prin1-to-string left) (prin1-to-string right)))))
+
+(defun grease-test-operations-equal-p (left right)
+  "Return non-nil when operation collections LEFT and RIGHT are equivalent."
+  (equal (grease-test-sort-operations left)
+         (grease-test-sort-operations right)))
+
 ;;;; Helper Function Tests
 
 (ert-deftest grease-test-is-dir-name ()
