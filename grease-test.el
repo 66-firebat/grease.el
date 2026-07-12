@@ -1041,6 +1041,135 @@ Each entry is a plist with `:path' and `:type'.  Directory entries use type
          :type 'user-error))
       (should (= mutations 0)))))
 
+;;;; Relocation Cycle Planning Tests
+
+(defun grease-test-cycle-plan (root names &optional type)
+  "Create and plan a cyclic rotation of NAMES below ROOT."
+  (let ((entry-type (or type 'file))
+        operations)
+    (cl-loop for name in names
+             for next-name in (append (cdr names) (list (car names)))
+             for id from 1
+             do (push (list :kind 'relocate :id id
+                            :src (expand-file-name name root)
+                            :dst (expand-file-name next-name root)
+                            :type entry-type)
+                      operations))
+    (grease--plan-transaction (nreverse operations))))
+
+(ert-deftest grease-test-plan-breaks-two-file-swap ()
+  "A two-file swap should be ordered through one temporary relocation."
+  (grease-test-with-temp-dir
+    (write-region "a" nil (expand-file-name "a" temp-dir))
+    (write-region "b" nil (expand-file-name "b" temp-dir))
+    (let ((plan (grease-test-cycle-plan temp-dir '("a" "b"))))
+      (should (= 3 (length plan)))
+      (should (= 1 (cl-count-if (lambda (operation)
+                                 (plist-get operation :temporary-p))
+                               plan)))
+      (should (equal (mapcar (lambda (operation) (plist-get operation :kind)) plan)
+                     '(relocate relocate relocate))))))
+
+(ert-deftest grease-test-plan-breaks-two-directory-swap ()
+  "A directory swap with nested contents should use directory relocations."
+  (grease-test-with-temp-dir
+    (grease-test-create-fixture
+     temp-dir
+     '((:path "foo" :type dir)
+       (:path "foo/nested/a.txt" :type file :content "a")
+       (:path "bar" :type dir)
+       (:path "bar/nested/b.txt" :type file :content "b")))
+    (let ((plan (grease-test-cycle-plan temp-dir '("foo" "bar") 'dir)))
+      (should (= 3 (length plan)))
+      (should (cl-every (lambda (operation)
+                          (and (eq (plist-get operation :kind) 'relocate)
+                               (eq (plist-get operation :type) 'dir)))
+                        plan)))))
+
+(ert-deftest grease-test-plan-breaks-three-file-rotation ()
+  "A three-file cycle should require only one temporary path."
+  (grease-test-with-temp-dir
+    (dolist (name '("a" "b" "c"))
+      (write-region name nil (expand-file-name name temp-dir)))
+    (let ((plan (grease-test-cycle-plan temp-dir '("a" "b" "c"))))
+      (should (= 4 (length plan)))
+      (should (= 1 (cl-count-if (lambda (operation)
+                                 (plist-get operation :temporary-p))
+                               plan))))))
+
+(ert-deftest grease-test-plan-breaks-three-directory-rotation ()
+  "A three-directory cycle should preserve relocation semantics."
+  (grease-test-with-temp-dir
+    (dolist (name '("a" "b" "c"))
+      (make-directory (expand-file-name name temp-dir))
+      (write-region name nil (expand-file-name (concat name "/inside") temp-dir)))
+    (let ((plan (grease-test-cycle-plan temp-dir '("a" "b" "c") 'dir)))
+      (should (= 4 (length plan)))
+      (should-not (cl-find-if (lambda (operation)
+                                (eq (plist-get operation :kind) 'copy))
+                              plan)))))
+
+(ert-deftest grease-test-plan-breaks-independent-cycles ()
+  "Independent relocation cycles should each receive one temporary path."
+  (grease-test-with-temp-dir
+    (dolist (name '("a" "b" "c" "d"))
+      (write-region name nil (expand-file-name name temp-dir)))
+    (let* ((a (expand-file-name "a" temp-dir))
+           (b (expand-file-name "b" temp-dir))
+           (c (expand-file-name "c" temp-dir))
+           (d (expand-file-name "d" temp-dir))
+           (plan (grease--plan-transaction
+                  `((:kind relocate :id 1 :src ,a :dst ,b :type file)
+                    (:kind relocate :id 2 :src ,b :dst ,a :type file)
+                    (:kind relocate :id 3 :src ,c :dst ,d :type file)
+                    (:kind relocate :id 4 :src ,d :dst ,c :type file)))))
+      (should (= 6 (length plan)))
+      (should (= 2 (cl-count-if (lambda (operation)
+                                 (plist-get operation :temporary-p))
+                               plan))))))
+
+(ert-deftest grease-test-plan-orders-copy-connected-to-cycle ()
+  "A copy consuming a cycle source should run before that source is moved."
+  (grease-test-with-temp-dir
+    (let ((a (expand-file-name "a" temp-dir))
+          (b (expand-file-name "b" temp-dir))
+          (copy (expand-file-name "copy" temp-dir)))
+      (write-region "a" nil a)
+      (write-region "b" nil b)
+      (let ((plan (grease--plan-transaction
+                   `((:kind relocate :id 1 :src ,a :dst ,b :type file)
+                     (:kind relocate :id 2 :src ,b :dst ,a :type file)
+                     (:kind copy :id 3 :source-id 1 :src ,a :dst ,copy :type file)))))
+        (should (eq (plist-get (car plan) :kind) 'copy))
+        (should (= 4 (length plan)))))))
+
+(ert-deftest grease-test-plan-avoids-temporary-name-collision ()
+  "An occupied temporary candidate should cause another name to be chosen."
+  (grease-test-with-temp-dir
+    (let ((a (expand-file-name "a" temp-dir))
+          (b (expand-file-name "b" temp-dir))
+          (collision (expand-file-name ".grease-tmp-1-1" temp-dir)))
+      (write-region "a" nil a)
+      (write-region "b" nil b)
+      (write-region "occupied" nil collision)
+      (let* ((plan (grease-test-cycle-plan temp-dir '("a" "b")))
+             (temporary (cl-find-if (lambda (operation)
+                                      (plist-get operation :temporary-p))
+                                    plan)))
+        (should temporary)
+        (should-not (equal (plist-get temporary :dst) collision))
+        (should-not (file-exists-p (plist-get temporary :dst)))))))
+
+(ert-deftest grease-test-cycle-plan-uses-no-recursive-copy ()
+  "Cycle breaking should add relocations rather than copy operations."
+  (grease-test-with-temp-dir
+    (make-directory (expand-file-name "a" temp-dir))
+    (make-directory (expand-file-name "b" temp-dir))
+    (let ((plan (grease-test-cycle-plan temp-dir '("a" "b") 'dir)))
+      (should (cl-every (lambda (operation)
+                          (eq (plist-get operation :kind) 'relocate))
+                        plan)))))
+
 ;;;; Clipboard Tests
 
 (ert-deftest grease-test-clipboard-copy ()

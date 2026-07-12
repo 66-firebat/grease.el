@@ -1637,11 +1637,87 @@ paths or authoritative states signal `user-error' before any mutation."
   "Return non-nil when PATH names an existing entry or symbolic link."
   (or (file-exists-p path) (file-symlink-p path)))
 
-(defun grease--plan-transaction (semantic-operations)
-  "Validate and safely order acyclic SEMANTIC-OPERATIONS.
-Return a new operation list.  Cyclic relocation dependencies are rejected for
-now; the cycle-breaking phase will handle them in the next milestone."
+(defun grease--temporary-cycle-path (operation reserved-paths)
+  "Return a unique temporary sibling path for OPERATION.
+RESERVED-PATHS contains every transaction source and destination."
+  (let* ((src (plist-get operation :src))
+         (directory (file-name-directory src))
+         (id (plist-get operation :id))
+         (counter 1)
+         candidate)
+    (while
+        (progn
+          (setq candidate
+                (expand-file-name
+                 (format ".grease-tmp-%s-%d" id counter) directory))
+          (cl-incf counter)
+          (or (grease--path-occupied-p candidate)
+              (gethash candidate reserved-paths)
+              (not (equal (file-remote-p src)
+                          (file-remote-p candidate))))))
+    candidate))
+
+(defun grease--break-relocation-cycles (semantic-operations)
+  "Break every relocation cycle in SEMANTIC-OPERATIONS with one temporary path."
   (let* ((operations (copy-tree semantic-operations))
+         (relocations
+          (cl-remove-if-not (lambda (operation)
+                              (eq (plist-get operation :kind) 'relocate))
+                            operations))
+         (source-map (make-hash-table :test 'equal))
+         (visited (make-hash-table :test 'eq))
+         (reserved (make-hash-table :test 'equal))
+         cycles temporary-operations)
+    (dolist (operation operations)
+      (when-let ((src (plist-get operation :src)))
+        (puthash src t reserved))
+      (when-let ((dst (grease--operation-destination operation)))
+        (puthash dst t reserved)))
+    (dolist (operation relocations)
+      (puthash (plist-get operation :src) operation source-map))
+
+    ;; Relocation dependencies form a functional graph: each relocation can
+    ;; be blocked by at most one operation occupying its destination.
+    (dolist (start relocations)
+      (unless (gethash start visited)
+        (let ((current start)
+              (positions (make-hash-table :test 'eq))
+              path cycle)
+          (while (and current
+                      (not (gethash current visited))
+                      (not (gethash current positions)))
+            (puthash current (length path) positions)
+            (setq path (append path (list current)))
+            (setq current (gethash (plist-get current :dst) source-map)))
+          (when (and current (gethash current positions))
+            (setq cycle (nthcdr (gethash current positions) path))
+            (push cycle cycles))
+          (dolist (member path)
+            (puthash member t visited)))))
+
+    (dolist (cycle cycles)
+      (let* ((breaker
+              (car (sort (copy-sequence cycle)
+                         (lambda (left right)
+                           (< (or (plist-get left :id) most-positive-fixnum)
+                              (or (plist-get right :id) most-positive-fixnum))))))
+             (original-src (plist-get breaker :src))
+             (temporary-path
+              (grease--temporary-cycle-path breaker reserved)))
+        (puthash temporary-path t reserved)
+        (push (list :kind 'relocate
+                    :id (plist-get breaker :id)
+                    :src original-src
+                    :dst temporary-path
+                    :type (plist-get breaker :type)
+                    :temporary-p t)
+              temporary-operations)
+        (setf (plist-get breaker :src) temporary-path)))
+    (append (nreverse temporary-operations) operations)))
+
+(defun grease--plan-transaction (semantic-operations)
+  "Validate and safely order SEMANTIC-OPERATIONS, breaking relocation cycles."
+  (let* ((operations (grease--break-relocation-cycles semantic-operations))
          (sources (make-hash-table :test 'equal))
          (destinations (make-hash-table :test 'equal))
          (creates (make-hash-table :test 'equal))
@@ -1699,7 +1775,10 @@ now; the cycle-breaking phase will handle them in the next milestone."
               (unless (eq ancestor operation)
                 (when (cl-some
                        (lambda (path)
-                         (and path (file-in-directory-p path ancestor-src)))
+                         (and path
+                              (not (equal (directory-file-name path)
+                                          (directory-file-name ancestor-src)))
+                              (file-in-directory-p path ancestor-src)))
                        (list (plist-get operation :src)
                              (grease--operation-destination operation)))
                   (user-error
@@ -1710,9 +1789,10 @@ now; the cycle-breaking phase will handle them in the next milestone."
         (let* ((kind (plist-get operation :kind))
                (src (plist-get operation :src))
                (dst (grease--operation-destination operation))
-               (blocker (and dst (gethash dst sources))))
+               (occupied-p (and dst (grease--path-occupied-p dst)))
+               (blocker (and occupied-p (gethash dst sources))))
           ;; Existing destinations must be vacated or explicitly deleted.
-          (when (and dst (grease--path-occupied-p dst))
+          (when occupied-p
             (unless (and blocker
                          (memq (plist-get blocker :kind) '(relocate delete)))
               (user-error "Destination is occupied outside transaction: %s" dst)))
