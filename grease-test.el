@@ -774,6 +774,154 @@ Each entry is a plist with `:path' and `:type'.  Directory entries use type
                     :dst)
                    "/tmp/foo"))))
 
+;;;; Unified Transaction Collection Tests
+
+(ert-deftest grease-test-build-transaction-cross-buffer-cut-is-relocation ()
+  "Cutting in one buffer and pasting in another should produce one relocation."
+  (grease-test-with-temp-dir
+    (let ((source-dir (expand-file-name "source" temp-dir))
+          (target-dir (expand-file-name "target" temp-dir)))
+      (make-directory source-dir)
+      (make-directory target-dir)
+      (write-region "content" nil (expand-file-name "move.txt" source-dir))
+      (grease-test-with-buffers ((source source-dir) (target target-dir))
+        (grease-test-cut-and-paste source target "move.txt")
+        (let ((operations (plist-get
+                           (grease--build-transaction (list source target))
+                           :operations)))
+          (should (grease-test-operations-equal-p
+                   operations
+                   `((:kind relocate :id ,(with-current-buffer target
+                                            (plist-get
+                                             (grease-test-goto-entry "move.txt") :id))
+                            :src ,(expand-file-name "move.txt" source-dir)
+                            :dst ,(expand-file-name "move.txt" target-dir)
+                            :type file)))))))))
+
+(ert-deftest grease-test-build-transaction-is-independent-of-buffer-order ()
+  "The initiating buffer order should not change transaction semantics."
+  (grease-test-with-temp-dir
+    (let ((source-dir (expand-file-name "source" temp-dir))
+          (target-dir (expand-file-name "target" temp-dir)))
+      (make-directory source-dir)
+      (make-directory target-dir)
+      (write-region "content" nil (expand-file-name "move.txt" source-dir))
+      (grease-test-with-buffers ((source source-dir) (target target-dir))
+        (grease-test-cut-and-paste source target "move.txt")
+        (should (grease-test-operations-equal-p
+                 (plist-get (grease--build-transaction (list source target))
+                            :operations)
+                 (plist-get (grease--build-transaction (list target source))
+                            :operations)))))))
+
+(ert-deftest grease-test-build-transaction-cross-buffer-copy ()
+  "Cross-buffer copy should not delete its committed source."
+  (grease-test-with-temp-dir
+    (let ((source-dir (expand-file-name "source" temp-dir))
+          (target-dir (expand-file-name "target" temp-dir)))
+      (make-directory source-dir)
+      (make-directory target-dir)
+      (write-region "content" nil (expand-file-name "copy.txt" source-dir))
+      (grease-test-with-buffers ((source source-dir) (target target-dir))
+        (with-current-buffer source
+          (grease-test-goto-entry "copy.txt")
+          (grease-copy))
+        (with-current-buffer target
+          (goto-char (point-max))
+          (grease-paste))
+        (let ((operations (plist-get (grease--build-transaction) :operations)))
+          (should (= 1 (length operations)))
+          (should (eq (plist-get (car operations) :kind) 'copy)))))))
+
+(ert-deftest grease-test-build-transaction-source-removal-is-delete ()
+  "Removing a committed identity without placing it should remain a deletion."
+  (grease-test-with-temp-dir
+    (write-region "content" nil (expand-file-name "delete.txt" temp-dir))
+    (grease-test-with-buffer temp-dir
+      (grease-test-goto-entry "delete.txt")
+      (grease-cut)
+      (let ((operations (plist-get
+                         (grease--build-transaction (list (current-buffer)))
+                         :operations)))
+        (should (= 1 (length operations)))
+        (should (eq (plist-get (car operations) :kind) 'delete))))))
+
+(ert-deftest grease-test-build-transaction-includes-previous-directory ()
+  "A snapshot staged before navigation should be included in the transaction."
+  (grease-test-with-temp-dir
+    (let ((first-dir (expand-file-name "first" temp-dir))
+          (second-dir (expand-file-name "second" temp-dir)))
+      (make-directory first-dir)
+      (make-directory second-dir)
+      (write-region "content" nil (expand-file-name "old.txt" first-dir))
+      (grease-test-with-buffer first-dir
+        (grease-test-edit-entry "old.txt" "new.txt")
+        (grease--stage-current-directory)
+        (grease--render second-dir t)
+        (let ((operations (plist-get
+                           (grease--build-transaction (list (current-buffer)))
+                           :operations)))
+          (should (= 1 (length operations)))
+          (should (eq (plist-get (car operations) :kind) 'relocate))
+          (should (equal (plist-get (car operations) :dst)
+                         (expand-file-name "new.txt" first-dir))))))))
+
+(ert-deftest grease-test-save-includes-previous-directory-snapshot ()
+  "Saving should apply changes staged before navigating to another directory."
+  (grease-test-with-temp-dir
+    (let ((first-dir (expand-file-name "first" temp-dir))
+          (second-dir (expand-file-name "second" temp-dir)))
+      (make-directory first-dir)
+      (make-directory second-dir)
+      (write-region "content" nil (expand-file-name "old.txt" first-dir))
+      (grease-test-with-buffer first-dir
+        (grease-test-edit-entry "old.txt" "new.txt")
+        (grease--stage-current-directory)
+        (grease--render second-dir t)
+        (let ((grease-skip-confirm-for-simple-edits t))
+          (should (grease-save)))
+        (should-not (file-exists-p (expand-file-name "old.txt" first-dir)))
+        (should (equal (grease-test-read-file
+                        (expand-file-name "new.txt" first-dir))
+                       "content"))))))
+
+(ert-deftest grease-test-build-transaction-rejects-conflicting-id-paths ()
+  "Dirty buffers assigning one ID to different paths should abort."
+  (grease-test-with-temp-dir
+    (write-region "content" nil (expand-file-name "same.txt" temp-dir))
+    (grease-test-with-buffers ((left temp-dir) (right temp-dir))
+      (with-current-buffer left
+        (grease-test-edit-entry "same.txt" "left.txt"))
+      (with-current-buffer right
+        (grease-test-edit-entry "same.txt" "right.txt"))
+      (should-error (grease--build-transaction (list left right))
+                    :type 'user-error))))
+
+(ert-deftest grease-test-build-transaction-rejects-duplicate-destination ()
+  "Different IDs claiming one destination should abort before mutation."
+  (let* ((buffer (current-buffer))
+         (baseline (grease-test-baseline
+                    '(:id 1 :path "/tmp/a" :type file :committed-p t)
+                    '(:id 2 :path "/tmp/b" :type file :committed-p t)))
+         (state (list :root-dir "/tmp/" :baseline baseline
+                      :entries '((:id 1 :path "/tmp/same" :type file)
+                                 (:id 2 :path "/tmp/same" :type file)))))
+    (cl-letf (((symbol-function 'grease--collect-buffer-state)
+               (lambda (_buffer) (list :buffer buffer :states (list state)))))
+      (should-error (grease--build-transaction (list buffer))
+                    :type 'user-error))))
+
+(ert-deftest grease-test-collect-buffer-state-ignores-whitespace-only-edit ()
+  "A whitespace-only dirty buffer should contribute no operations."
+  (grease-test-with-temp-dir
+    (grease-test-with-buffer temp-dir
+      (goto-char (point-max))
+      (let ((inhibit-read-only t))
+        (insert "   \n"))
+      (should grease--buffer-dirty-p)
+      (should-not (grease--collect-buffer-state (current-buffer)))
+      (should-not grease--buffer-dirty-p))))
+
 ;;;; Clipboard Tests
 
 (ert-deftest grease-test-clipboard-copy ()

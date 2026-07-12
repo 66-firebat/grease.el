@@ -155,7 +155,8 @@ Each value records `:id', original `:path', `:type', and `:committed-p'.")
 
 ;; List of pending operations to be applied on save
 (defvar-local grease--pending-changes nil
-  "List of pending file operations in current buffer.")
+  "Snapshots staged while navigating directories in the current buffer.
+Each snapshot contains `:root-dir', `:baseline', and desired `:entries'.")
 
 ;; last directory and line number visited for cursor position persistence
 (defvar grease--project-positions (make-hash-table :test 'equal)
@@ -1485,20 +1486,147 @@ accepts named operation plists directly."
     (kind (error "Unknown semantic operation kind %S" kind))))
 
 (defun grease--calculate-changes ()
-  "Calculate current buffer changes using stable file identities."
-  (let* ((entries (grease--scan-buffer))
-         (name-conflicts (grease--detect-name-conflicts entries)))
-    (when name-conflicts
+  "Calculate all current and staged changes in this Grease buffer."
+  (let* ((transaction (grease--build-transaction (list (current-buffer))))
+         (changes
+          (mapcar #'grease--semantic-operation-to-legacy
+                  (plist-get transaction :operations))))
+    ;; Preserve the old executor's deterministic deletion-first behavior.
+    (sort changes
+          (lambda (left right)
+            (and (eq (car left) :delete)
+                 (not (eq (car right) :delete)))))))
+
+(defun grease--live-buffers ()
+  "Return every live buffer using `grease-mode'."
+  (cl-remove-if-not
+   (lambda (buffer)
+     (and (buffer-live-p buffer)
+          (with-current-buffer buffer
+            (derived-mode-p 'grease-mode))))
+   (buffer-list)))
+
+(defun grease--snapshot-current-directory ()
+  "Return an identity-based snapshot of the current displayed directory."
+  (let ((entries (grease--scan-buffer)))
+    (when-let ((conflicts (grease--detect-name-conflicts entries)))
       (user-error "Filename conflicts detected in this directory: %s"
-                  (mapconcat #'identity name-conflicts ", ")))
-    (let ((changes
-           (mapcar #'grease--semantic-operation-to-legacy
-                   (grease--diff-by-id grease--baseline-by-id entries))))
-      ;; Preserve the old executor's deterministic deletion-first behavior.
-      (sort changes
-            (lambda (left right)
-              (and (eq (car left) :delete)
-                   (not (eq (car right) :delete))))))))
+                  (mapconcat #'identity conflicts ", ")))
+    (list :root-dir grease--root-dir
+          :baseline (copy-hash-table grease--baseline-by-id)
+          :entries (copy-tree entries))))
+
+(defun grease--stage-current-directory ()
+  "Stage the current directory snapshot before navigating elsewhere."
+  (let* ((snapshot (grease--snapshot-current-directory))
+         (operations (grease--diff-by-id
+                      (plist-get snapshot :baseline)
+                      (plist-get snapshot :entries))))
+    ;; Revisiting and editing a directory replaces its older staged view.
+    (setq grease--pending-changes
+          (cl-remove (plist-get snapshot :root-dir) grease--pending-changes
+                     :key (lambda (state) (plist-get state :root-dir))
+                     :test #'equal))
+    (when operations
+      (push snapshot grease--pending-changes))
+    (setq grease--buffer-dirty-p nil)
+    operations))
+
+(defun grease--collect-buffer-state (buffer)
+  "Collect effective staged and current directory states from BUFFER.
+Whitespace-only dirty buffers are marked clean and contribute no state."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (when (derived-mode-p 'grease-mode)
+        (let ((states (copy-sequence grease--pending-changes)))
+          (when grease--buffer-dirty-p
+            (let* ((snapshot (grease--snapshot-current-directory))
+                   (operations
+                    (grease--diff-by-id (plist-get snapshot :baseline)
+                                        (plist-get snapshot :entries))))
+              (if operations
+                  (push snapshot states)
+                (setq grease--buffer-dirty-p nil))))
+          (when states
+            (list :buffer buffer :states (nreverse states))))))))
+
+(defun grease--build-transaction (&optional buffers)
+  "Build one semantic transaction from dirty Grease BUFFERS.
+When BUFFERS is nil, inspect every live Grease buffer.  Conflicting desired
+paths or authoritative states signal `user-error' before any mutation."
+  (let ((collections (delq nil
+                           (mapcar #'grease--collect-buffer-state
+                                   (or buffers (grease--live-buffers)))))
+        (baseline (make-hash-table :test 'eql))
+        (claims (make-hash-table :test 'eql))
+        participants)
+    (dolist (collection collections)
+      (push (plist-get collection :buffer) participants)
+      (dolist (state (plist-get collection :states))
+        (let ((state-baseline (plist-get state :baseline))
+              (current-by-id (make-hash-table :test 'eql)))
+          (dolist (entry (plist-get state :entries))
+            (puthash (plist-get entry :id) entry current-by-id)
+            (push (list :entry entry
+                        :authoritative-p
+                        (not (null (gethash (plist-get entry :id)
+                                            state-baseline))))
+                  (gethash (plist-get entry :id) claims)))
+          (maphash
+           (lambda (id original)
+             (let ((known (gethash id baseline)))
+               (when (and known
+                          (not (equal (plist-get known :path)
+                                      (plist-get original :path))))
+                 (user-error "Conflicting committed paths for ID %s" id))
+               (unless known
+                 (puthash id original baseline)))
+             (unless (gethash id current-by-id)
+               (push (list :entry nil :authoritative-p t)
+                     (gethash id claims))))
+           state-baseline))))
+
+    (let (desired-entries)
+      (maphash
+       (lambda (id id-claims)
+         (let* ((entries (delq nil (mapcar (lambda (claim)
+                                            (plist-get claim :entry))
+                                          id-claims)))
+                (paths (cl-remove-duplicates
+                        (mapcar (lambda (entry) (plist-get entry :path)) entries)
+                        :test #'equal))
+                (deleted-p (cl-some (lambda (claim)
+                                      (and (plist-get claim :authoritative-p)
+                                           (not (plist-get claim :entry))))
+                                    id-claims))
+                (authoritative-present-p
+                 (cl-some (lambda (claim)
+                            (and (plist-get claim :authoritative-p)
+                                 (plist-get claim :entry)))
+                          id-claims)))
+           (when (> (length paths) 1)
+             (user-error "Conflicting desired paths for ID %s: %s"
+                         id (mapconcat #'identity paths ", ")))
+           (when (and deleted-p authoritative-present-p)
+             (user-error "Conflicting deletion and placement for ID %s" id))
+           ;; An absent source claim plus a non-authoritative destination claim
+           ;; is a cross-buffer relocation, not a conflict.
+           (when (and entries (not (and deleted-p authoritative-present-p)))
+             (push (car entries) desired-entries))))
+       claims)
+
+      (let ((destinations (make-hash-table :test 'equal)))
+        (dolist (entry desired-entries)
+          (let* ((path (plist-get entry :path))
+                 (other-id (gethash path destinations)))
+            (when (and other-id (not (equal other-id (plist-get entry :id))))
+              (user-error "Multiple IDs claim destination %s" path))
+            (puthash path (plist-get entry :id) destinations))))
+
+      (list :operations (grease--diff-by-id baseline desired-entries)
+            :buffers (nreverse (cl-remove-duplicates participants))
+            :baseline baseline
+            :entries desired-entries))))
 
 (defun grease--apply-changes (changes)
   "Apply CHANGES to the filesystem."
@@ -1961,12 +2089,9 @@ be used.  Timers do not reliably run with the Grease buffer current."
              (path (grease--get-full-path name)))
         (if (eq type 'dir)
             (progn
-              ;; Store any changes before moving
+              ;; Store an identity-based directory snapshot before moving.
               (when grease--buffer-dirty-p
-                (let ((changes (grease--calculate-changes)))
-                  (when changes
-                    (setq grease--pending-changes
-                          (append changes grease--pending-changes)))))
+                (grease--stage-current-directory))
               (grease--render path t)
               ;; Restore cursor position, clamped to valid lines
               (grease--goto-line-clamped current-line))
@@ -1982,12 +2107,9 @@ be used.  Timers do not reliably run with the Grease buffer current."
   (let* ((child-dir (directory-file-name grease--root-dir))
          (child-name (file-name-nondirectory child-dir))
          (parent-dir (expand-file-name ".." grease--root-dir)))
-    ;; Store any changes before moving
+    ;; Store an identity-based directory snapshot before moving.
     (when grease--buffer-dirty-p
-      (let ((changes (grease--calculate-changes)))
-        (when changes
-          (setq grease--pending-changes
-                (append changes grease--pending-changes)))))
+      (grease--stage-current-directory))
     (grease--render parent-dir t)
     (grease--goto-file child-name)))
 
