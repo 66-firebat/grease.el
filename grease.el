@@ -2497,26 +2497,37 @@ be used.  Timers do not reliably run with the Grease buffer current."
       (forward-line 1)
       (grease--constrain-cursor))))
 
+(defun grease--create-buffer (dir &optional target-file)
+  "Create and return a new Grease buffer displaying DIR.
+If TARGET-FILE is non-nil, position point on that entry.  This function does
+not display or select the returned buffer."
+  (let* ((directory (file-name-as-directory (expand-file-name dir)))
+         (default-directory directory)
+         (buffer-name (format "*grease:%s*" (grease--project-name)))
+         (buffer (generate-new-buffer buffer-name))
+         succeeded)
+    (unwind-protect
+        (progn
+          (with-current-buffer buffer
+            (grease-mode)
+            (grease--render directory)
+            (if target-file
+                (grease--goto-file target-file)
+              (goto-char (point-min))
+              (forward-line 1)
+              (grease--constrain-cursor)))
+          (setq succeeded t)
+          buffer)
+      (unless succeeded
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
+
 ;;;###autoload
 (defun grease-open (dir &optional target-file)
   "Open a new Grease buffer for DIR.
 If TARGET-FILE is provided, position cursor on it."
   (interactive "DGrease directory: ")
-  (let* ((proj-root (file-name-as-directory (expand-file-name (grease--project-root))))
-         (proj-name (grease--project-name))
-         (bufname   (format "*grease:%s*" proj-name))
-         (buf       (generate-new-buffer bufname)))
-    (with-current-buffer buf
-      (grease-mode)
-      ;; Always render the requested directory
-      (grease--render dir)
-      (if target-file
-          (grease--goto-file target-file)
-        ;; Default to top
-        (goto-char (point-min))
-        (forward-line 1)
-        (grease--constrain-cursor)))
-    (switch-to-buffer buf)))
+  (switch-to-buffer (grease--create-buffer dir target-file)))
 
 ;;;###autoload
 (defun grease-toggle ()

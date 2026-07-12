@@ -577,7 +577,84 @@ Each entry is a plist with `:path' and `:type'.  Directory entries use type
             (should (equal (plist-get registry-entry :path) path)))
           (should (file-exists-p path)))))))
 
-;;;; Buffer Rendering Tests
+;;;; Buffer Creation and Rendering Tests
+
+(ert-deftest grease-test-create-buffer-returns-distinct-live-buffers ()
+  "Creating the same directory twice should return two independent buffers."
+  (grease-test-with-temp-dir
+    (grease-test-with-clean-state
+      (let ((first (grease--create-buffer temp-dir))
+            (second (grease--create-buffer temp-dir)))
+        (unwind-protect
+            (progn
+              (should (buffer-live-p first))
+              (should (buffer-live-p second))
+              (should-not (eq first second))
+              (should-not (equal (buffer-name first) (buffer-name second)))
+              (dolist (buffer (list first second))
+                (with-current-buffer buffer
+                  (should (derived-mode-p 'grease-mode))
+                  (should (equal grease--root-dir
+                                 (file-name-as-directory
+                                  (expand-file-name temp-dir)))))))
+          (dolist (buffer (list first second))
+            (when (buffer-live-p buffer)
+              (kill-buffer buffer))))))))
+
+(ert-deftest grease-test-create-buffer-keeps-local-state-independent ()
+  "Editing one created buffer should not alter the other buffer's local state."
+  (grease-test-with-temp-dir
+    (write-region "content" nil (expand-file-name "file.txt" temp-dir))
+    (grease-test-with-clean-state
+      (let ((first (grease--create-buffer temp-dir))
+            (second (grease--create-buffer temp-dir)))
+        (unwind-protect
+            (progn
+              (with-current-buffer first
+                (grease-test-edit-entry "file.txt" "renamed.txt")
+                (setq grease--pending-changes '(:first-only))
+                (should grease--buffer-dirty-p))
+              (with-current-buffer second
+                (should-not grease--buffer-dirty-p)
+                (should-not grease--pending-changes)
+                (should (string-match-p "file.txt" (buffer-string)))
+                (should-not (string-match-p "renamed.txt" (buffer-string)))))
+          (dolist (buffer (list first second))
+            (when (buffer-live-p buffer)
+              (kill-buffer buffer))))))))
+
+(ert-deftest grease-test-create-buffer-reuses-stable-file-ids ()
+  "Existing files should retain their IDs across independently created buffers."
+  (grease-test-with-temp-dir
+    (write-region "content" nil (expand-file-name "stable.txt" temp-dir))
+    (grease-test-with-clean-state
+      (let ((first (grease--create-buffer temp-dir))
+            (second (grease--create-buffer temp-dir)))
+        (unwind-protect
+            (let ((first-id
+                   (with-current-buffer first
+                     (plist-get (grease-test-goto-entry "stable.txt") :id)))
+                  (second-id
+                   (with-current-buffer second
+                     (plist-get (grease-test-goto-entry "stable.txt") :id))))
+              (should (numberp first-id))
+              (should (equal first-id second-id)))
+          (dolist (buffer (list first second))
+            (when (buffer-live-p buffer)
+              (kill-buffer buffer))))))))
+
+(ert-deftest grease-test-create-buffer-does-not-display-buffer ()
+  "Creating a Grease buffer should not change the selected window's buffer."
+  (grease-test-with-temp-dir
+    (grease-test-with-clean-state
+      (let ((original (current-buffer))
+            (created (grease--create-buffer temp-dir)))
+        (unwind-protect
+            (progn
+              (should (eq (current-buffer) original))
+              (should-not (eq created original)))
+          (when (buffer-live-p created)
+            (kill-buffer created)))))))
 
 (ert-deftest grease-test-render-creates-header ()
   "Test that rendering creates a header line."
