@@ -1170,6 +1170,136 @@ Each entry is a plist with `:path' and `:type'.  Directory entries use type
                           (eq (plist-get operation :kind) 'relocate))
                         plan)))))
 
+;;;; Transaction Executor Tests
+
+(ert-deftest grease-test-executor-two-file-swap-preserves-contents ()
+  "Executing a planned file swap should preserve both distinct contents."
+  (grease-test-with-temp-dir
+    (let ((a (expand-file-name "a" temp-dir))
+          (b (expand-file-name "b" temp-dir)))
+      (write-region "content-a" nil a)
+      (write-region "content-b" nil b)
+      (let* ((plan (grease-test-cycle-plan temp-dir '("a" "b")))
+             (result (grease--execute-transaction plan)))
+        (should (plist-get result :success-p))
+        (should (equal (grease-test-read-file a) "content-b"))
+        (should (equal (grease-test-read-file b) "content-a"))
+        (should-not (plist-get result :temporary-paths))))))
+
+(ert-deftest grease-test-executor-directory-swap-preserves-trees ()
+  "Executing a directory swap should preserve every nested file."
+  (grease-test-with-temp-dir
+    (grease-test-create-fixture
+     temp-dir
+     '((:path "foo/nested/a.txt" :type file :content "foo-content")
+       (:path "bar/deep/b.txt" :type file :content "bar-content")))
+    (let ((result (grease--execute-transaction
+                   (grease-test-cycle-plan temp-dir '("foo" "bar") 'dir))))
+      (should (plist-get result :success-p))
+      (should (equal (grease-test-read-file
+                      (expand-file-name "foo/deep/b.txt" temp-dir))
+                     "bar-content"))
+      (should (equal (grease-test-read-file
+                      (expand-file-name "bar/nested/a.txt" temp-dir))
+                     "foo-content")))))
+
+(ert-deftest grease-test-executor-three-way-rotation-preserves-identities ()
+  "A three-way rotation should move contents with their stable identities."
+  (grease-test-with-temp-dir
+    (dolist (pair '(("a" . "A") ("b" . "B") ("c" . "C")))
+      (write-region (cdr pair) nil (expand-file-name (car pair) temp-dir)))
+    (let ((result (grease--execute-transaction
+                   (grease-test-cycle-plan temp-dir '("a" "b" "c")))))
+      (should (plist-get result :success-p))
+      (should (equal (grease-test-read-file (expand-file-name "a" temp-dir)) "C"))
+      (should (equal (grease-test-read-file (expand-file-name "b" temp-dir)) "A"))
+      (should (equal (grease-test-read-file (expand-file-name "c" temp-dir)) "B")))))
+
+(ert-deftest grease-test-executor-cross-directory-move-preserves-content ()
+  "A semantic relocation should preserve file contents across directories."
+  (grease-test-with-temp-dir
+    (let* ((target-dir (expand-file-name "target" temp-dir))
+           (source (expand-file-name "move.txt" temp-dir))
+           (target (expand-file-name "move.txt" target-dir)))
+      (make-directory target-dir)
+      (write-region "moving-content" nil source)
+      (let ((result (grease--execute-transaction
+                     `((:kind relocate :id 1 :src ,source :dst ,target
+                              :type file)))))
+        (should (plist-get result :success-p))
+        (should-not (file-exists-p source))
+        (should (equal (grease-test-read-file target) "moving-content"))))))
+
+(ert-deftest grease-test-executor-cross-filesystem-copy-failure-keeps-source ()
+  "A failed cross-filesystem copy must not delete the relocation source."
+  (grease-test-with-temp-dir
+    (let ((source (expand-file-name "source" temp-dir))
+          (target (expand-file-name "target" temp-dir)))
+      (write-region "source-content" nil source)
+      (cl-letf (((symbol-function 'grease--same-filesystem-adapter-p)
+                 (lambda (&rest _) nil))
+                ((symbol-function 'copy-file)
+                 (lambda (&rest _) (error "injected copy failure"))))
+        (let ((result (grease--execute-transaction
+                       `((:kind relocate :id 1 :src ,source :dst ,target
+                                :type file)))))
+          (should-not (plist-get result :success-p))))
+      (should (equal (grease-test-read-file source) "source-content"))
+      (should-not (file-exists-p target)))))
+
+(ert-deftest grease-test-executor-failure-preserves-staged-state ()
+  "Executor failure should not clear buffer, clipboard, or staged state."
+  (grease-test-with-temp-dir
+    (let ((source (expand-file-name "source" temp-dir))
+          (target (expand-file-name "target" temp-dir))
+          (grease--buffer-dirty-p t)
+          (grease--pending-changes '(:staged))
+          (grease--clipboard '(:operation cut)))
+      (write-region "content" nil source)
+      (cl-letf (((symbol-function 'rename-file)
+                 (lambda (&rest _) (error "injected failure"))))
+        (let ((result (grease--execute-transaction
+                       `((:kind relocate :id 1 :src ,source :dst ,target
+                                :type file)))))
+          (should-not (plist-get result :success-p))
+          (should (equal (plist-get (plist-get result :operation) :id) 1))
+          (should (plist-get result :error))))
+      (should grease--buffer-dirty-p)
+      (should (equal grease--pending-changes '(:staged)))
+      (should (equal grease--clipboard '(:operation cut)))
+      (should (file-exists-p source)))))
+
+(ert-deftest grease-test-executor-refuses-newly-appearing-destination ()
+  "A destination appearing after planning should not be overwritten."
+  (grease-test-with-temp-dir
+    (let ((source (expand-file-name "source" temp-dir))
+          (target (expand-file-name "target" temp-dir)))
+      (write-region "source-content" nil source)
+      (let ((plan (grease--plan-transaction
+                   `((:kind relocate :id 1 :src ,source :dst ,target
+                            :type file)))))
+        (write-region "external-content" nil target)
+        (let ((result (grease--execute-transaction plan)))
+          (should-not (plist-get result :success-p))
+          (should (equal (grease-test-read-file source) "source-content"))
+          (should (equal (grease-test-read-file target) "external-content")))))))
+
+(ert-deftest grease-test-executor-removes-temporary-paths-after-success ()
+  "Successful cycle execution should leave no implementation temporary path."
+  (grease-test-with-temp-dir
+    (write-region "a" nil (expand-file-name "a" temp-dir))
+    (write-region "b" nil (expand-file-name "b" temp-dir))
+    (let* ((plan (grease-test-cycle-plan temp-dir '("a" "b")))
+           (temporary-paths
+            (delq nil (mapcar (lambda (operation)
+                                (and (plist-get operation :temporary-p)
+                                     (plist-get operation :dst)))
+                              plan)))
+           (result (grease--execute-transaction plan)))
+      (should (plist-get result :success-p))
+      (dolist (path temporary-paths)
+        (should-not (file-exists-p path))))))
+
 ;;;; Clipboard Tests
 
 (ert-deftest grease-test-clipboard-copy ()

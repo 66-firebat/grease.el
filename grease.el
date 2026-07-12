@@ -1832,68 +1832,101 @@ RESERVED-PATHS contains every transaction source and destination."
             (push ready ordered)))
         (nreverse ordered)))))
 
+(defun grease--copy-path-without-overwrite (src dst)
+  "Copy SRC to DST, refusing to overwrite any existing destination."
+  (when (grease--path-occupied-p dst)
+    (error "Destination already exists: %s" dst))
+  (make-directory (file-name-directory dst) t)
+  (if (file-directory-p src)
+      (copy-directory src dst nil nil t)
+    (copy-file src dst nil)))
+
+(defun grease--delete-path (path)
+  "Delete file or directory PATH."
+  (if (file-directory-p path)
+      (delete-directory path t)
+    (delete-file path)))
+
+(defun grease--execute-operation (operation)
+  "Execute one planned semantic OPERATION without overwriting destinations."
+  (let ((kind (plist-get operation :kind))
+        (src (plist-get operation :src))
+        (dst (grease--operation-destination operation)))
+    (pcase kind
+      ('create
+       (when (grease--path-occupied-p dst)
+         (error "Destination already exists: %s" dst))
+       (make-directory (file-name-directory dst) t)
+       (if (eq (plist-get operation :type) 'dir)
+           (make-directory dst nil)
+         (write-region "" nil dst nil 'silent nil t)))
+      ('copy
+       (grease--copy-path-without-overwrite src dst))
+      ('relocate
+       (when (grease--path-occupied-p dst)
+         (error "Destination already exists: %s" dst))
+       (make-directory (file-name-directory dst) t)
+       (if (grease--same-filesystem-adapter-p src dst)
+           (rename-file src dst nil)
+         ;; Cross-filesystem relocation is copy-then-delete.  The source is
+         ;; retained if copying fails.
+         (grease--copy-path-without-overwrite src dst)
+         (grease--delete-path src)))
+      ('delete
+       (grease--delete-path src))
+      (_ (error "Unknown filesystem operation kind %S" kind)))))
+
+(defun grease--execute-transaction (plan)
+  "Execute semantic PLAN and return an explicit result plist.
+Execution stops at the first error.  No buffer, registry, clipboard, or staged
+state is cleared here; the save coordinator owns transaction commit state."
+  (let (completed temporary-paths failure failure-operation)
+    (catch 'stop
+      (dolist (operation plan)
+        (condition-case err
+            (progn
+              (grease--execute-operation operation)
+              (push operation completed)
+              (when (plist-get operation :temporary-p)
+                (push (plist-get operation :dst) temporary-paths))
+              (when-let ((src (plist-get operation :src)))
+                (setq temporary-paths (delete src temporary-paths))))
+          (error
+           (setq failure err
+                 failure-operation operation)
+           (throw 'stop nil)))))
+    (if failure
+        (list :success-p nil
+              :operation failure-operation
+              :error failure
+              :completed (nreverse completed)
+              :temporary-paths (nreverse temporary-paths))
+      (list :success-p t
+            :completed (nreverse completed)
+            :temporary-paths (nreverse temporary-paths)))))
+
+(defun grease--legacy-change-to-semantic (change)
+  "Convert positional CHANGE for compatibility with older internal callers."
+  (pcase change
+    (`(:create ,path)
+     (list :kind 'create :dst (directory-file-name path)
+           :type (if (string-suffix-p "/" path) 'dir 'file)))
+    (`(:delete ,path)
+     (list :kind 'delete :src path
+           :type (if (file-directory-p path) 'dir 'file)))
+    ((or `(:rename ,src ,dst) `(:move ,src ,dst))
+     (list :kind 'relocate :src src :dst dst
+           :type (if (file-directory-p src) 'dir 'file)))
+    (`(:copy ,src ,dst)
+     (list :kind 'copy :src src :dst dst
+           :type (if (file-directory-p src) 'dir 'file)))
+    (_ (error "Unknown legacy filesystem change %S" change))))
+
 (defun grease--apply-changes (changes)
-  "Apply CHANGES to the filesystem."
-  (let ((errors '()))
-    (dolist (change changes)
-      (pcase change
-        (`(:create ,path)
-         (message "Grease: Creating %s" path)
-         (condition-case e 
-             (if (string-suffix-p "/" path)
-                 (make-directory path t)
-               (make-directory (file-name-directory path) t)
-               (write-region "" nil path t)) ; 't' creates the file
-           (error (push (format "Failed to create %s: %s" path e) errors))))
-
-        (`(:delete ,path)
-         (message "Grease: Deleting %s" path)
-         (condition-case e (if (file-directory-p path)
-                             (delete-directory path t)
-                           (delete-file path))
-           (error (push (format "Failed to delete %s: %s" path e) errors))))
-
-        (`(:rename ,old-path ,new-path)
-         (message "Grease: Renaming %s -> %s" old-path new-path)
-         (condition-case e 
-             (progn
-               (make-directory (file-name-directory new-path) t)
-               (rename-file old-path new-path t))
-           (error (push (format "Failed to rename %s: %s" old-path e) errors))))
-
-        (`(:copy ,src-path ,dst-path)
-         (if (string= src-path dst-path)
-             (message "Grease: Skipping copy to same location %s" src-path)
-           (message "Grease: Copying %s -> %s" src-path dst-path)
-           (condition-case e
-               (progn
-                 (make-directory (file-name-directory dst-path) t)
-                 (if (file-directory-p src-path)
-                     (copy-directory src-path dst-path)
-                   (copy-file src-path dst-path t)))
-             (error (push (format "Failed to copy %s: %s" src-path e) errors)))))
-
-        (`(:move ,src-path ,dst-path)
-         (message "Grease: Moving %s -> %s" src-path dst-path)
-         (condition-case e
-             (progn
-               (make-directory (file-name-directory dst-path) t)
-               (if (file-directory-p src-path)
-                   (copy-directory src-path dst-path)
-                 (copy-file src-path dst-path t))
-               (if (file-directory-p src-path)
-                   (delete-directory src-path t)
-                 (delete-file src-path)))
-           (error (push (format "Failed to move %s: %s" src-path e) errors))))))
-
-    ;; Clear all pending changes after successful operations
-    (when (and changes (not errors))
-      (setq grease--pending-changes nil)
-      (clrhash grease--deleted-file-ids))
-
-    (if errors
-        (warn "Grease: Encountered errors:\n%s" (mapconcat #'identity errors "\n"))
-      (message "Grease: All changes applied successfully."))))
+  "Compatibility wrapper executing positional CHANGES.
+Return the explicit executor result and do not clear any global state."
+  (grease--execute-transaction
+   (mapcar #'grease--legacy-change-to-semantic changes)))
 
 ;;;; Preview Buffer System
 
