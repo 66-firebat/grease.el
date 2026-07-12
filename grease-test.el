@@ -689,6 +689,162 @@ Each entry is a plist with `:path' and `:type'.  Directory entries use type
             (when (buffer-live-p buffer)
               (kill-buffer buffer))))))))
 
+(ert-deftest grease-test-direct-window-deletion-kills-hidden-grease-buffer ()
+  "Direct `delete-window' callers should not bypass Grease buffer disposal."
+  (grease-test-with-temp-dir
+    (grease-test-with-clean-state
+      (let ((source (grease--create-buffer temp-dir)))
+        (save-window-excursion
+          (delete-other-windows)
+          (let* ((source-window (split-window-right))
+                 (other-window (selected-window)))
+            (set-window-buffer source-window source)
+            (set-window-buffer other-window (get-buffer-create "*scratch*"))
+            ;; Delete the non-selected Grease window, as ace-window and other
+            ;; window managers commonly do.
+            (delete-window source-window)
+            (should-not (buffer-live-p source))))))))
+
+(ert-deftest grease-test-direct-window-deletion-cancel-keeps-window ()
+  "Direct deletion should be vetoed when unified saving is cancelled."
+  (grease-test-with-temp-dir
+    (write-region "content" nil (expand-file-name "old.txt" temp-dir))
+    (grease-test-with-clean-state
+      (let ((source (grease--create-buffer temp-dir)))
+        (unwind-protect
+            (save-window-excursion
+              (delete-other-windows)
+              (let ((source-window (split-window-right)))
+                (set-window-buffer source-window source)
+                (with-current-buffer source
+                  (grease-test-edit-entry "old.txt" "new.txt"))
+                (cl-letf (((symbol-function 'grease-save-all-buffers)
+                           (lambda () nil)))
+                  (delete-window source-window))
+                (should (window-live-p source-window))
+                (should (buffer-live-p source))))
+          (when (buffer-live-p source)
+            (kill-buffer source)))))))
+
+(ert-deftest grease-test-direct-window-deletion-leaves-nongrease-buffer-live ()
+  "Global deletion advice should preserve normal behavior for other buffers."
+  (let ((buffer (generate-new-buffer " *nongrease-window-test*")))
+    (unwind-protect
+        (save-window-excursion
+          (delete-other-windows)
+          (let ((window (split-window-right)))
+            (set-window-buffer window buffer)
+            (delete-window window)
+            (should (buffer-live-p buffer))))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
+
+(ert-deftest grease-test-close-commands-are-remapped-in-grease-mode ()
+  "Emacs and Evil close-window commands should use Grease-aware cleanup."
+  (with-temp-buffer
+    (grease-mode)
+    (dolist (command '(delete-window kill-buffer-and-window evil-window-delete))
+      (should (eq (command-remapping command) 'grease-close-window)))))
+
+(ert-deftest grease-test-close-last-displayed-window-kills-clean-buffer ()
+  "Closing a clean buffer's last displayed window should kill the buffer."
+  (grease-test-with-temp-dir
+    (grease-test-with-clean-state
+      (let ((source (grease--create-buffer temp-dir)))
+        (save-window-excursion
+          (delete-other-windows)
+          (switch-to-buffer source)
+          (let ((other-window (split-window-right)))
+            (set-window-buffer other-window (get-buffer-create "*scratch*"))
+            (should (grease-close-window))
+            (should-not (buffer-live-p source))))))))
+
+(ert-deftest grease-test-close-dirty-buffer-kills-only-after-save-success ()
+  "A successful unified save should allow last-window buffer disposal."
+  (grease-test-with-temp-dir
+    (write-region "content" nil (expand-file-name "old.txt" temp-dir))
+    (grease-test-with-clean-state
+      (let ((source (grease--create-buffer temp-dir))
+            save-called)
+        (save-window-excursion
+          (delete-other-windows)
+          (switch-to-buffer source)
+          (let ((other-window (split-window-right)))
+            (set-window-buffer other-window (get-buffer-create "*scratch*")))
+          (grease-test-edit-entry "old.txt" "new.txt")
+          (cl-letf (((symbol-function 'grease-save-all-buffers)
+                     (lambda () (setq save-called t) t)))
+            (should (grease-close-window)))
+          (should save-called)
+          (should-not (buffer-live-p source)))))))
+
+(ert-deftest grease-test-close-one-of-multiple-views-keeps-buffer-live ()
+  "Closing one window should not kill a Grease buffer still displayed elsewhere."
+  (grease-test-with-temp-dir
+    (grease-test-with-clean-state
+      (let ((source (grease--create-buffer temp-dir)))
+        (unwind-protect
+            (save-window-excursion
+              (delete-other-windows)
+              (switch-to-buffer source)
+              (split-window-right)
+              (should (= 2 (length (get-buffer-window-list source nil t))))
+              (should (grease-close-window))
+              (should (buffer-live-p source))
+              (should (= 1 (length (get-buffer-window-list source nil t)))))
+          (when (buffer-live-p source)
+            (kill-buffer source)))))))
+
+(ert-deftest grease-test-close-cancel-keeps-window-and-dirty-buffer ()
+  "Cancelling unified save should prevent window and buffer disposal."
+  (grease-test-with-temp-dir
+    (write-region "content" nil (expand-file-name "old.txt" temp-dir))
+    (grease-test-with-clean-state
+      (let ((source (grease--create-buffer temp-dir)))
+        (unwind-protect
+            (save-window-excursion
+              (delete-other-windows)
+              (switch-to-buffer source)
+              (let ((other-window (split-window-right)))
+                (set-window-buffer other-window (get-buffer-create "*scratch*")))
+              (grease-test-edit-entry "old.txt" "new.txt")
+              (cl-letf (((symbol-function 'grease-save-all-buffers)
+                         (lambda () nil)))
+                (should-not (grease-close-window)))
+              (should (buffer-live-p source))
+              (should (get-buffer-window source t))
+              (with-current-buffer source
+                (should grease--buffer-dirty-p)))
+          (when (buffer-live-p source)
+            (kill-buffer source)))))))
+
+(ert-deftest grease-test-kill-hidden-buffers-removes-clean-grease-buffers ()
+  "Explicit cleanup should kill every clean undisplayed Grease buffer."
+  (grease-test-with-temp-dir
+    (grease-test-with-clean-state
+      (let ((first (grease--create-buffer temp-dir))
+            (second (grease--create-buffer temp-dir)))
+        (should (= 2 (grease-kill-hidden-buffers)))
+        (should-not (buffer-live-p first))
+        (should-not (buffer-live-p second))))))
+
+(ert-deftest grease-test-kill-hidden-buffers-cancel-keeps-dirty-buffers ()
+  "Cancelled unified saving should leave hidden dirty Grease buffers alive."
+  (grease-test-with-temp-dir
+    (write-region "content" nil (expand-file-name "old.txt" temp-dir))
+    (grease-test-with-clean-state
+      (let ((buffer (grease--create-buffer temp-dir)))
+        (unwind-protect
+            (progn
+              (with-current-buffer buffer
+                (grease-test-edit-entry "old.txt" "new.txt"))
+              (cl-letf (((symbol-function 'grease-save-all-buffers)
+                         (lambda () nil)))
+                (should (= 0 (grease-kill-hidden-buffers))))
+              (should (buffer-live-p buffer)))
+          (when (buffer-live-p buffer)
+            (kill-buffer buffer)))))))
+
 (ert-deftest grease-test-split-commands-are-remapped-in-grease-mode ()
   "Standard, Evil, and Doom split commands should use Grease-aware splits."
   (with-temp-buffer

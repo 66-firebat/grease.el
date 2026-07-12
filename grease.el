@@ -2550,6 +2550,11 @@ be used.  Timers do not reliably run with the Grease buffer current."
       #'grease-split-window-right)
     (define-key map [remap +evil/window-split-and-follow]
       #'grease-split-window-below)
+    ;; Closing the last window should dispose of its Grease buffer rather than
+    ;; leaving a hidden transaction participant behind.
+    (define-key map [remap delete-window] #'grease-close-window)
+    (define-key map [remap kill-buffer-and-window] #'grease-close-window)
+    (define-key map [remap evil-window-delete] #'grease-close-window)
     ;; Sorting keybindings
     (define-key map (kbd "C-c s s") #'grease-cycle-sort)
     (define-key map (kbd "C-c s t") #'grease-sort-by-type)
@@ -2674,6 +2679,73 @@ select it.  The source buffer's uncommitted text is intentionally not cloned."
   (grease--split-window-with-new-buffer #'split-window-below))
 
 ;;;###autoload
+(defvar grease--deleting-window-p nil
+  "Non-nil while Grease is delegating an approved window deletion.")
+
+(defun grease--advice-delete-window (original-function &optional window)
+  "Dispose of a Grease buffer when ORIGINAL-FUNCTION deletes its last WINDOW."
+  (let* ((target-window (or window (selected-window)))
+         (buffer (and (window-live-p target-window)
+                      (window-buffer target-window))))
+    (if (or grease--deleting-window-p
+            (not (buffer-live-p buffer))
+            (not (with-current-buffer buffer
+                   (derived-mode-p 'grease-mode))))
+        (funcall original-function target-window)
+      (let* ((last-window-p
+              (= 1 (length (get-buffer-window-list buffer nil t))))
+             (may-close-p
+              (or (not last-window-p)
+                  (with-current-buffer buffer
+                    (not (or grease--buffer-dirty-p
+                             grease--pending-changes)))
+                  (with-current-buffer buffer
+                    (grease-save-all-buffers)))))
+        (when may-close-p
+          (let ((grease--deleting-window-p t))
+            (funcall original-function target-window))
+          (when (and last-window-p
+                     (buffer-live-p buffer)
+                     (not (get-buffer-window buffer t)))
+            (kill-buffer buffer))
+          t)))))
+
+(defun grease-close-window ()
+  "Close the selected window, disposing of its last displayed Grease buffer."
+  (interactive)
+  (unless (derived-mode-p 'grease-mode)
+    (user-error "Current buffer is not a Grease buffer"))
+  (delete-window (selected-window)))
+
+;;;###autoload
+(defun grease-kill-hidden-buffers ()
+  "Kill live Grease buffers that are not displayed in any window.
+If any hidden buffer has staged changes, run the unified save first.  A
+cancelled or failed save leaves every hidden buffer alive."
+  (interactive)
+  (let* ((hidden
+          (cl-remove-if
+           (lambda (buffer) (get-buffer-window buffer t))
+           (grease--live-buffers)))
+         (dirty-p
+          (cl-some (lambda (buffer)
+                     (with-current-buffer buffer
+                       (or grease--buffer-dirty-p grease--pending-changes)))
+                   hidden)))
+    (if (and dirty-p (not (grease-save-all-buffers)))
+        (progn
+          (message "Grease: Hidden-buffer cleanup cancelled.")
+          0)
+      (let ((count 0))
+        (dolist (buffer hidden)
+          (when (buffer-live-p buffer)
+            (kill-buffer buffer)
+            (cl-incf count)))
+        (message "Grease: Killed %d hidden buffer%s."
+                 count (if (= count 1) "" "s"))
+        count))))
+
+;;;###autoload
 (defun grease-open (dir &optional target-file)
   "Open a new Grease buffer for DIR.
 If TARGET-FILE is provided, position cursor on it."
@@ -2739,6 +2811,10 @@ If already open, quit (saving position). Otherwise open project root."
     (apply orig-fun args)))
 
 (advice-add 'save-buffer :around #'grease-advice-save-buffer)
+;; Window managers such as Evil, Doom, and ace-window often call the primitive
+;; directly, bypassing command remapping.  This advice delegates unchanged for
+;; every non-Grease window and only adds last-view disposal for Grease buffers.
+(advice-add 'delete-window :around #'grease--advice-delete-window)
 
 ;; Reset file registry on initial load
 (defun grease-reset-registry ()
