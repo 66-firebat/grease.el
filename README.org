@@ -121,7 +121,8 @@ M-x grease-open RET ~/projects/
 #+end_src
 
 This creates a buffer named ~*grease:project-name*~ with a header line
-and the directory contents.
+and the directory contents. Opening another directory creates another Grease
+buffer (Emacs may add a suffix such as ~<2>~ to its name).
 
 - ~M-x grease-toggle~ :: Toggle Grease for the current project.
 - ~M-x grease-here~ :: Open Grease directly at the project root.
@@ -144,7 +145,34 @@ When ready, commit changes with:
 C-c C-s
 ;; or
 :w
+;; or explicitly:
+M-x grease-save-all-buffers
 #+end_src
+
+** Unified Saves and Filesystem Safety
+Saving any Grease buffer commits the effective changes staged across *all* live
+Grease buffers as one transaction. This applies equally to ~C-c C-s~,
+~save-buffer~, Evil ~:write~, and ~M-x grease-save-all-buffers~.
+
+- Cutting an entry from one Grease buffer and pasting it into another is one
+  move. Saving from either the source or destination produces the same result.
+- Confirmation describes the combined transaction. Choosing cancel changes
+  nothing; choosing discard discards the changes in every participating
+  Grease buffer.
+- Cyclic renames are supported, including file swaps, directory swaps with
+  nested contents, and larger rotations.
+- Grease validates destinations before execution and refuses to overwrite an
+  entry created externally or otherwise outside the transaction.
+- Cycle handling may briefly use a hidden sibling name beginning with
+  ~.grease-tmp-~. These names are implementation details and should not remain
+  after a successful save. If execution fails during a cycle, Grease stops
+  immediately and reports the failed operation; a temporary path may remain so
+  its contents can be recovered rather than discarded.
+
+Current limitation: transactions that edit an entry inside a directory while
+also relocating one of that entry's ancestor directories are rejected. This
+avoids ambiguous path rebasing and filesystem mutation; perform those changes
+as separate saves instead.
 
 ** Preview Window
 Toggle a preview window on the right side showing file contents or directory listings:
@@ -207,7 +235,8 @@ On save:
 - ~M-x grease-here~ :: Open Grease at the project root.
 
 ** File Operations
-- ~M-x grease-save~ :: Save all staged changes to disk.
+- ~M-x grease-save~ :: Delegate to the unified all-buffer save command.
+- ~M-x grease-save-all-buffers~ :: Save all staged Grease-buffer changes as one transaction.
 - ~M-x grease-visit~ :: Visit the file or enter a directory at point.
 - ~M-x grease-up-directory~ :: Move to the parent directory.
 - ~M-x grease-refresh~ :: Discard staged changes and reload from disk.
@@ -311,6 +340,8 @@ Here's an example Doom-style setup:
 - [X] Create directories by ending a name with "/".
 - [X] Copy/paste files across directories (~yy/p~).
 - [X] Move files with cut/paste (~dd/p~).
+- [X] Commit changes from all live Grease buffers as one transaction.
+- [X] Support cyclic file and directory renames without overwriting contents.
 - [X] Multi-line yank/delete in visual mode.
 - [X] Duplicate a line (~C-c C-d~).
 - [X] Cursor constraints (never get stuck in the hidden ID/icon column).
