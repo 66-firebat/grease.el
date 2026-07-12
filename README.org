@@ -127,6 +127,27 @@ buffer (Emacs may add a suffix such as ~<2>~ to its name).
 - ~M-x grease-toggle~ :: Toggle Grease for the current project.
 - ~M-x grease-here~ :: Open Grease directly at the project root.
 
+** Splitting Grease Windows
+Splitting a window from ~grease-mode~ creates a *new, independent Grease
+buffer* starting in the same directory. It does not show the original buffer in
+two windows.
+
+The normal Emacs, Evil, and Doom split commands are remapped locally while in
+Grease, including ~C-x 2~, ~C-x 3~, Evil ~C-w s~/~C-w v~, and Doom's
+split-and-follow commands. You can also invoke the commands explicitly:
+
+- ~M-x grease-split-window-below~ :: Open a new same-directory Grease buffer below.
+- ~M-x grease-split-window-right~ :: Open a new same-directory Grease buffer to the right.
+
+The new buffer renders committed filesystem state rather than cloning unsaved
+text from the source buffer. Each buffer has independent editing and navigation
+state, while stable file identities and saving remain unified across all live
+Grease buffers. If two dirty buffers assign the same file identity to
+conflicting destinations, saving aborts before filesystem mutation.
+
+Preview windows are unaffected by this behavior, and splitting outside
+~grease-mode~ continues to use normal Emacs behavior.
+
 ** Editing Operations
 Each line after the header represents a file or directory.
 (using vim/evil bindings here but it should with default emacs keybinds too)
@@ -233,6 +254,8 @@ On save:
 - ~M-x grease-open~ :: Open a Grease buffer for a directory.
 - ~M-x grease-toggle~ :: Toggle Grease for the current project.
 - ~M-x grease-here~ :: Open Grease at the project root.
+- ~M-x grease-split-window-right~ :: Split right into a new same-directory Grease buffer.
+- ~M-x grease-split-window-below~ :: Split below into a new same-directory Grease buffer.
 
 ** File Operations
 - ~M-x grease-save~ :: Delegate to the unified all-buffer save command.
@@ -276,6 +299,12 @@ Inside ~grease-mode~:
 | ~RET~  |       | Visit file/directory |
 | ~-~    |       | Go up one directory  |
 | ~g r~  |       | Refresh buffer       |
+
+*** Window Splitting
+| Evil   | Emacs   | Action                                  |
+|--------+---------+-----------------------------------------|
+| ~C-w s~  | ~C-x 2~ | New same-directory Grease buffer below |
+| ~C-w v~  | ~C-x 3~ | New same-directory Grease buffer right |
 
 *** File Operations
 | Evil | Emacs   | Action       |
@@ -342,6 +371,7 @@ Here's an example Doom-style setup:
 - [X] Move files with cut/paste (~dd/p~).
 - [X] Commit changes from all live Grease buffers as one transaction.
 - [X] Support cyclic file and directory renames without overwriting contents.
+- [X] Open independent same-directory Grease buffers when splitting windows.
 - [X] Multi-line yank/delete in visual mode.
 - [X] Duplicate a line (~C-c C-d~).
 - [X] Cursor constraints (never get stuck in the hidden ID/icon column).
