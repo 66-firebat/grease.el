@@ -689,6 +689,62 @@ Each entry is a plist with `:path' and `:type'.  Directory entries use type
             (when (buffer-live-p buffer)
               (kill-buffer buffer))))))))
 
+(ert-deftest grease-test-split-commands-are-remapped-in-grease-mode ()
+  "Standard, Evil, and Doom split commands should use Grease-aware splits."
+  (with-temp-buffer
+    (grease-mode)
+    (dolist (pair '((split-window-right . grease-split-window-right)
+                    (split-window-below . grease-split-window-below)
+                    (evil-window-vsplit . grease-split-window-right)
+                    (evil-window-split . grease-split-window-below)
+                    (+evil/window-vsplit-and-follow . grease-split-window-right)
+                    (+evil/window-split-and-follow . grease-split-window-below)))
+      (should (eq (command-remapping (car pair)) (cdr pair))))))
+
+(ert-deftest grease-test-split-remapping-is-local-to-grease-mode ()
+  "Non-Grease buffers should retain ordinary split command behavior."
+  (with-temp-buffer
+    (fundamental-mode)
+    (should-not (command-remapping 'split-window-right))
+    (should-not (command-remapping 'split-window-below))
+    (should-not (command-remapping 'evil-window-vsplit))
+    (should-not (command-remapping 'evil-window-split))))
+
+(ert-deftest grease-test-standard-split-key-uses-remapped-command ()
+  "A normal Emacs split key should resolve to the Grease-aware command."
+  (with-temp-buffer
+    (grease-mode)
+    (should (eq (key-binding (kbd "C-x 2"))
+                'grease-split-window-below))
+    (should (eq (key-binding (kbd "C-x 3"))
+                'grease-split-window-right))))
+
+(ert-deftest grease-test-preview-window-does-not-create-grease-split-buffer ()
+  "Opening a preview should remain separate from Grease-aware split commands."
+  (grease-test-with-temp-dir
+    (write-region "preview" nil (expand-file-name "file.txt" temp-dir))
+    (grease-test-with-clean-state
+      (let ((source (grease--create-buffer temp-dir)) preview-buffer)
+        (unwind-protect
+            (save-window-excursion
+              (delete-other-windows)
+              (switch-to-buffer source)
+              (grease-test-goto-entry "file.txt")
+              (cl-letf (((symbol-function 'grease--create-buffer)
+                         (lambda (&rest _)
+                           (error "Preview must not create a Grease buffer"))))
+                (grease--open-preview))
+              (setq preview-buffer grease--preview-buffer)
+              (should (buffer-live-p preview-buffer))
+              (should-not (with-current-buffer preview-buffer
+                            (derived-mode-p 'grease-mode))))
+          (when (buffer-live-p source)
+            (with-current-buffer source
+              (grease--close-preview)))
+          (dolist (buffer (list source preview-buffer))
+            (when (buffer-live-p buffer)
+              (kill-buffer buffer))))))))
+
 (ert-deftest grease-test-split-renders-committed-not-dirty-source-state ()
   "A split should render disk state rather than clone uncommitted source text."
   (grease-test-with-temp-dir

@@ -2435,6 +2435,16 @@ be used.  Timers do not reliably run with the Grease buffer current."
     (define-key map (kbd "C-c C-v") #'grease-paste)
     (define-key map (kbd "C-c C-p") #'grease-toggle-preview)
     (define-key map (kbd "C-c .") #'grease-toggle-hidden)
+    ;; Standard Emacs, Evil, and Doom split commands should create a distinct
+    ;; Grease buffer rather than a second window onto the same buffer.
+    (define-key map [remap split-window-right] #'grease-split-window-right)
+    (define-key map [remap split-window-below] #'grease-split-window-below)
+    (define-key map [remap evil-window-vsplit] #'grease-split-window-right)
+    (define-key map [remap evil-window-split] #'grease-split-window-below)
+    (define-key map [remap +evil/window-vsplit-and-follow]
+      #'grease-split-window-right)
+    (define-key map [remap +evil/window-split-and-follow]
+      #'grease-split-window-below)
     ;; Sorting keybindings
     (define-key map (kbd "C-c s s") #'grease-cycle-sort)
     (define-key map (kbd "C-c s t") #'grease-sort-by-type)
