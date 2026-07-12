@@ -643,6 +643,75 @@ Each entry is a plist with `:path' and `:type'.  Directory entries use type
             (when (buffer-live-p buffer)
               (kill-buffer buffer))))))))
 
+(ert-deftest grease-test-split-window-right-creates-new-grease-buffer ()
+  "Splitting right should display and select an independent Grease buffer."
+  (grease-test-with-temp-dir
+    (write-region "content" nil (expand-file-name "file.txt" temp-dir))
+    (grease-test-with-clean-state
+      (let ((source (grease--create-buffer temp-dir)) new-buffer)
+        (unwind-protect
+            (save-window-excursion
+              (delete-other-windows)
+              (switch-to-buffer source)
+              (let ((source-window (selected-window)))
+                (grease-split-window-right)
+                (setq new-buffer (current-buffer))
+                (should (= 2 (length (window-list))))
+                (should-not (eq (selected-window) source-window))
+                (should (eq (window-buffer source-window) source))
+                (should-not (eq new-buffer source))
+                (should (derived-mode-p 'grease-mode))
+                (should (equal grease--root-dir
+                               (file-name-as-directory
+                                (expand-file-name temp-dir))))))
+          (dolist (buffer (list source new-buffer))
+            (when (buffer-live-p buffer)
+              (kill-buffer buffer))))))))
+
+(ert-deftest grease-test-split-window-below-creates-new-grease-buffer ()
+  "Splitting below should display and select an independent Grease buffer."
+  (grease-test-with-temp-dir
+    (grease-test-with-clean-state
+      (let ((source (grease--create-buffer temp-dir)) new-buffer)
+        (unwind-protect
+            (save-window-excursion
+              (delete-other-windows)
+              (switch-to-buffer source)
+              (let ((source-window (selected-window)))
+                (grease-split-window-below)
+                (setq new-buffer (current-buffer))
+                (should (= 2 (length (window-list))))
+                (should-not (eq (selected-window) source-window))
+                (should (eq (window-buffer source-window) source))
+                (should-not (eq new-buffer source))
+                (should (derived-mode-p 'grease-mode))))
+          (dolist (buffer (list source new-buffer))
+            (when (buffer-live-p buffer)
+              (kill-buffer buffer))))))))
+
+(ert-deftest grease-test-split-renders-committed-not-dirty-source-state ()
+  "A split should render disk state rather than clone uncommitted source text."
+  (grease-test-with-temp-dir
+    (write-region "content" nil (expand-file-name "disk.txt" temp-dir))
+    (grease-test-with-clean-state
+      (let ((source (grease--create-buffer temp-dir)) new-buffer)
+        (unwind-protect
+            (save-window-excursion
+              (delete-other-windows)
+              (switch-to-buffer source)
+              (grease-test-edit-entry "disk.txt" "dirty.txt")
+              (grease-split-window-right)
+              (setq new-buffer (current-buffer))
+              (should (string-match-p "disk.txt" (buffer-string)))
+              (should-not (string-match-p "dirty.txt" (buffer-string)))
+              (should-not grease--buffer-dirty-p)
+              (with-current-buffer source
+                (should grease--buffer-dirty-p)
+                (should (string-match-p "dirty.txt" (buffer-string)))))
+          (dolist (buffer (list source new-buffer))
+            (when (buffer-live-p buffer)
+              (kill-buffer buffer))))))))
+
 (ert-deftest grease-test-create-buffer-does-not-display-buffer ()
   "Creating a Grease buffer should not change the selected window's buffer."
   (grease-test-with-temp-dir

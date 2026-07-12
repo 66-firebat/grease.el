@@ -2522,6 +2522,42 @@ not display or select the returned buffer."
         (when (buffer-live-p buffer)
           (kill-buffer buffer))))))
 
+(defun grease--split-window-with-new-buffer (split-function)
+  "Split the selected Grease window using SPLIT-FUNCTION.
+Display a new Grease buffer for the current directory in the new window and
+select it.  The source buffer's uncommitted text is intentionally not cloned."
+  (unless (derived-mode-p 'grease-mode)
+    (user-error "Current buffer is not a Grease buffer"))
+  (let* ((directory grease--root-dir)
+         (new-buffer (grease--create-buffer directory))
+         new-window
+         succeeded)
+    (unwind-protect
+        (progn
+          (setq new-window (funcall split-function))
+          (set-window-buffer new-window new-buffer)
+          (select-window new-window)
+          (setq succeeded t)
+          new-window)
+      (unless succeeded
+        (when (and (window-live-p new-window)
+                   (not (eq new-window (selected-window))))
+          (delete-window new-window))
+        (when (buffer-live-p new-buffer)
+          (kill-buffer new-buffer))))))
+
+;;;###autoload
+(defun grease-split-window-right ()
+  "Split right and select a new Grease buffer for the current directory."
+  (interactive)
+  (grease--split-window-with-new-buffer #'split-window-right))
+
+;;;###autoload
+(defun grease-split-window-below ()
+  "Split below and select a new Grease buffer for the current directory."
+  (interactive)
+  (grease--split-window-with-new-buffer #'split-window-below))
+
 ;;;###autoload
 (defun grease-open (dir &optional target-file)
   "Open a new Grease buffer for DIR.
