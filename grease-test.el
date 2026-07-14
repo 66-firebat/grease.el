@@ -2625,6 +2625,467 @@ Each entry is a plist with `:path' and `:type'.  Directory entries use type
           (should-not (grease-save)))
         (should prompted)))))
 
+;;;; Symlink Navigation Provenance Tests
+
+(ert-deftest grease-test-visit-symlink-toggle-returns-to-source-entry ()
+  "Toggling after visiting a file symlink must select the source link."
+  (grease-test-with-temp-dir
+    (let* ((source-dir (expand-file-name "source" temp-dir))
+           (target-dir (expand-file-name "target" temp-dir))
+           (target-file (expand-file-name "target.txt" target-dir))
+           grease-buffer target-buffer returned-buffer)
+      (make-directory source-dir)
+      (make-directory target-dir)
+      (write-region "content" nil target-file)
+      (make-symbolic-link target-file (expand-file-name "link.txt" source-dir))
+      (grease-test-with-clean-state
+        (unwind-protect
+            (save-window-excursion
+              (setq grease-buffer (grease--create-buffer source-dir "link.txt"))
+              (switch-to-buffer grease-buffer)
+              (grease-visit)
+              (setq target-buffer (current-buffer))
+              (should-not (derived-mode-p 'grease-mode))
+              (should (eq (plist-get
+                           (window-parameter
+                            nil grease--return-location-window-parameter)
+                           :destination-buffer)
+                          target-buffer))
+              (grease-toggle)
+              (setq returned-buffer (current-buffer))
+              (should (derived-mode-p 'grease-mode))
+              (should (equal grease--root-dir
+                             (file-name-as-directory source-dir)))
+              (should (equal (plist-get (grease--get-line-data) :name)
+                             "link.txt"))
+              ;; Toggling off and back on should retain window-local provenance.
+              (grease-toggle)
+              (should (eq (current-buffer) target-buffer))
+              (grease-toggle)
+              (should (derived-mode-p 'grease-mode))
+              (should (equal (plist-get (grease--get-line-data) :name)
+                             "link.txt")))
+          (dolist (buffer (list grease-buffer target-buffer returned-buffer))
+            (when (buffer-live-p buffer)
+              (kill-buffer buffer))))))))
+
+(ert-deftest grease-test-up-directory-returns-through-directory-symlink ()
+  "Going up from a directory symlink root must select its source link."
+  (grease-test-with-temp-dir
+    (let ((target (expand-file-name "target-dir" temp-dir)))
+      (make-directory target)
+      (write-region "content" nil (expand-file-name "nested.txt" target))
+      (make-symbolic-link "target-dir" (expand-file-name "dir-link" temp-dir))
+      (grease-test-with-buffer temp-dir
+        (grease-test-goto-entry "dir-link")
+        (grease-visit)
+        (should (equal grease--root-dir
+                       (file-name-as-directory
+                        (expand-file-name "dir-link" temp-dir))))
+        (should grease--directory-return-stack)
+        (grease-up-directory)
+        (should (equal grease--root-dir
+                       (file-name-as-directory temp-dir)))
+        (should (equal (plist-get (grease--get-line-data) :name)
+                       "dir-link"))
+        (should-not grease--directory-return-stack)))))
+
+(ert-deftest grease-test-directory-symlink-toggle-returns-to-source-entry ()
+  "Toggling from inside a directory symlink must return to its source link."
+  (grease-test-with-temp-dir
+    (let ((target (expand-file-name "target-dir" temp-dir))
+          grease-buffer returned-buffer)
+      (make-directory target)
+      (make-symbolic-link "target-dir" (expand-file-name "dir-link" temp-dir))
+      (grease-test-with-clean-state
+        (unwind-protect
+            (save-window-excursion
+              (setq grease-buffer (grease--create-buffer temp-dir "dir-link"))
+              (switch-to-buffer grease-buffer)
+              (grease-visit)
+              (should grease--directory-return-stack)
+              (grease-toggle)
+              (should-not (derived-mode-p 'grease-mode))
+              (grease-toggle)
+              (setq returned-buffer (current-buffer))
+              (should (derived-mode-p 'grease-mode))
+              (should (equal grease--root-dir
+                             (file-name-as-directory temp-dir)))
+              (should (equal (plist-get (grease--get-line-data) :name)
+                             "dir-link")))
+          (dolist (buffer (list grease-buffer returned-buffer))
+            (when (buffer-live-p buffer)
+              (kill-buffer buffer))))))))
+
+(ert-deftest grease-test-symlink-return-location-is-window-local ()
+  "Two windows visiting one target must retain independent source links."
+  (grease-test-with-temp-dir
+    (let* ((first-link (expand-file-name "first-link" temp-dir))
+           (second-link (expand-file-name "second-link" temp-dir))
+           (destination (generate-new-buffer " *grease-destination*"))
+           second-window)
+      (make-symbolic-link "target" first-link)
+      (make-symbolic-link "target" second-link)
+      (unwind-protect
+          (save-window-excursion
+            (switch-to-buffer destination)
+            (setq second-window (split-window-right))
+            (set-window-buffer second-window destination)
+            (grease--set-window-return-location
+             (selected-window)
+             (list :dir temp-dir :entry-name "first-link"
+                   :entry-path first-link :entry-id nil)
+             destination)
+            (grease--set-window-return-location
+             second-window
+             (list :dir temp-dir :entry-name "second-link"
+                   :entry-path second-link :entry-id nil)
+             destination)
+            (should (equal
+                     (plist-get (grease--window-return-location
+                                 (selected-window))
+                                :entry-name)
+                     "first-link"))
+            (should (equal
+                     (plist-get (grease--window-return-location second-window)
+                                :entry-name)
+                     "second-link")))
+        (when (buffer-live-p destination)
+          (kill-buffer destination))))))
+
+(ert-deftest grease-test-missing-symlink-source-clears-return-location ()
+  "A vanished source link must invalidate and clear window provenance."
+  (grease-test-with-temp-dir
+    (let ((destination (current-buffer))
+          (missing (expand-file-name "missing-link" temp-dir)))
+      (grease--set-window-return-location
+       (selected-window)
+       (list :dir temp-dir :entry-name "missing-link"
+             :entry-path missing :entry-id nil)
+       destination)
+      (should-not (grease--window-return-location))
+      (should-not
+       (window-parameter nil grease--return-location-window-parameter)))))
+
+(ert-deftest grease-test-ordinary-file-visit-clears-symlink-provenance ()
+  "Visiting an ordinary file must clear stale symlink return state."
+  (grease-test-with-temp-dir
+    (let ((ordinary (expand-file-name "ordinary.txt" temp-dir))
+          grease-buffer file-buffer)
+      (write-region "content" nil ordinary)
+      (grease-test-with-clean-state
+        (unwind-protect
+            (save-window-excursion
+              (setq grease-buffer
+                    (grease--create-buffer temp-dir "ordinary.txt"))
+              (switch-to-buffer grease-buffer)
+              (grease--set-window-return-location
+               (selected-window)
+               (list :dir temp-dir :entry-name "old-link"
+                     :entry-path (expand-file-name "old-link" temp-dir)
+                     :entry-id nil)
+               grease-buffer)
+              (grease-visit)
+              (setq file-buffer (current-buffer))
+              (should-not
+               (window-parameter
+                nil grease--return-location-window-parameter)))
+          (dolist (buffer (list grease-buffer file-buffer))
+            (when (buffer-live-p buffer)
+              (kill-buffer buffer))))))))
+
+(ert-deftest grease-test-cancelled-symlink-visit-does-not-set-provenance ()
+  "Cancelling save before a symlink visit must not change window provenance."
+  (grease-test-with-temp-dir
+    (write-region "content" nil (expand-file-name "target.txt" temp-dir))
+    (make-symbolic-link "target.txt" (expand-file-name "link.txt" temp-dir))
+    (let (grease-buffer)
+      (grease-test-with-clean-state
+        (unwind-protect
+            (save-window-excursion
+              (setq grease-buffer (grease--create-buffer temp-dir "link.txt"))
+              (switch-to-buffer grease-buffer)
+              (setq grease--buffer-dirty-p t)
+              (cl-letf (((symbol-function 'grease-save)
+                         (lambda () nil)))
+                (grease-visit))
+              (should (eq (current-buffer) grease-buffer))
+              (should-not
+               (window-parameter
+                nil grease--return-location-window-parameter)))
+          (when (buffer-live-p grease-buffer)
+            (kill-buffer grease-buffer)))))))
+
+;;;; Symlink Filesystem Operation Tests
+
+(ert-deftest grease-test-dangling-symlink-is-committed-entry ()
+  "A dangling symlink must remain a committed filesystem entry."
+  (grease-test-with-temp-dir
+    (let ((path (expand-file-name "broken-link" temp-dir)))
+      (make-symbolic-link "missing-target" path)
+      (grease-test-with-buffer temp-dir
+        (let* ((data (grease-test-goto-entry "broken-link"))
+               (id (plist-get data :id))
+               (baseline (gethash id grease--baseline-by-id)))
+          (should (eq (plist-get data :entry-kind) 'symlink))
+          (should (equal (plist-get data :link-target) "missing-target"))
+          (should (eq (grease--line-data-source-kind data) 'file))
+          (should (plist-get baseline :committed-p))
+          (should (eq (plist-get baseline :entry-kind) 'symlink)))))))
+
+(ert-deftest grease-test-directory-symlink-has-distinct-entry-kind ()
+  "A directory symlink must not be modeled as an ordinary directory."
+  (grease-test-with-temp-dir
+    (let ((target (expand-file-name "target-dir" temp-dir))
+          (link (expand-file-name "dir-link" temp-dir)))
+      (make-directory target)
+      (make-symbolic-link "target-dir" link)
+      (grease-test-with-buffer temp-dir
+        (let* ((data (grease-test-goto-entry "dir-link"))
+               (baseline (gethash (plist-get data :id)
+                                  grease--baseline-by-id)))
+          (should (eq (plist-get data :type) 'dir))
+          (should (eq (plist-get data :entry-kind) 'symlink))
+          (should (eq (plist-get baseline :entry-kind) 'symlink))
+          (should (equal (plist-get baseline :link-target) "target-dir")))))))
+
+(ert-deftest grease-test-save-same-directory-symlink-copy ()
+  "Copying in one directory must create another symlink with the raw target."
+  (grease-test-with-temp-dir
+    (write-region "content" nil (expand-file-name "target.txt" temp-dir))
+    (make-symbolic-link "target.txt" (expand-file-name "link" temp-dir))
+    (grease-test-with-buffer temp-dir
+      (grease-test-goto-entry "link")
+      (grease-copy)
+      (should (equal (plist-get grease--clipboard :entry-kinds) '(symlink)))
+      (should (equal (plist-get grease--clipboard :link-targets)
+                     '("target.txt")))
+      (grease-paste)
+      (let* ((transaction (grease--build-transaction (list (current-buffer))))
+             (operation (car (plist-get transaction :operations))))
+        (should (eq (plist-get operation :kind) 'copy))
+        (should (eq (plist-get operation :entry-kind) 'symlink))
+        (should (equal (plist-get operation :link-target) "target.txt")))
+      (let ((grease-skip-confirm-for-simple-edits t))
+        (should (grease-save)))
+      (should (equal (file-symlink-p (expand-file-name "link-copy" temp-dir))
+                     "target.txt"))
+      (should (equal (grease-test-read-file
+                      (expand-file-name "target.txt" temp-dir))
+                     "content")))))
+
+(ert-deftest grease-test-save-directory-symlink-copy ()
+  "Copying a directory symlink must not recursively copy its target."
+  (grease-test-with-temp-dir
+    (let ((target (expand-file-name "target-dir" temp-dir)))
+      (make-directory target)
+      (write-region "content" nil (expand-file-name "nested.txt" target))
+      (make-symbolic-link "target-dir" (expand-file-name "dir-link" temp-dir))
+      (grease-test-with-buffer temp-dir
+        (grease-test-goto-entry "dir-link")
+        (grease-copy)
+        (grease-paste)
+        (let ((grease-skip-confirm-for-simple-edits t))
+          (should (grease-save)))
+        (should (equal (file-symlink-p
+                        (expand-file-name "dir-link-copy" temp-dir))
+                       "target-dir"))
+        (should (equal (grease-test-read-file
+                        (expand-file-name "nested.txt" target))
+                       "content"))))))
+
+(ert-deftest grease-test-save-symlink-duplicate-line ()
+  "Duplicating and renaming a symlink line must create another symlink."
+  (grease-test-with-temp-dir
+    (write-region "content" nil (expand-file-name "target" temp-dir))
+    (make-symbolic-link "target" (expand-file-name "link" temp-dir))
+    (grease-test-with-buffer temp-dir
+      (let* ((source (grease-test-goto-entry "link"))
+             (source-id (plist-get source :id)))
+        (grease-duplicate-line)
+        (let* ((copy (cl-find-if
+                      (lambda (entry)
+                        (equal (plist-get entry :source-id) source-id))
+                      (grease--scan-buffer)))
+               (copy-id (plist-get copy :id)))
+          (should copy)
+          (grease-test-edit-entry copy-id "duplicate-link")))
+      (let ((grease-skip-confirm-for-simple-edits t))
+        (should (grease-save)))
+      (should (equal (file-symlink-p
+                      (expand-file-name "duplicate-link" temp-dir))
+                     "target")))))
+
+(ert-deftest grease-test-save-cross-directory-symlink-copy ()
+  "Cross-directory copy must preserve the link itself and its raw target."
+  (grease-test-with-temp-dir
+    (let ((source-dir (expand-file-name "source" temp-dir))
+          (target-dir (expand-file-name "target" temp-dir)))
+      (make-directory source-dir)
+      (make-directory target-dir)
+      (write-region "content" nil (expand-file-name "referent" source-dir))
+      (make-symbolic-link "referent" (expand-file-name "link" source-dir))
+      (grease-test-with-buffers ((source source-dir) (target target-dir))
+        (with-current-buffer source
+          (grease-test-goto-entry "link")
+          (grease-copy))
+        (with-current-buffer target
+          (goto-char (point-max))
+          (grease-paste)
+          (let ((grease-skip-confirm-for-simple-edits t))
+            (should (grease-save))))
+        (should (equal (file-symlink-p (expand-file-name "link" source-dir))
+                       "referent"))
+        (should (equal (file-symlink-p (expand-file-name "link" target-dir))
+                       "../source/referent"))
+        (should (equal (file-truename (expand-file-name "link" target-dir))
+                       (file-truename (expand-file-name "referent" source-dir))))
+        (should (equal (grease-test-read-file
+                        (expand-file-name "referent" source-dir))
+                       "content"))))))
+
+(ert-deftest grease-test-save-cross-directory-symlink-move ()
+  "Cut/paste must relocate a symlink without replacing it with a file."
+  (grease-test-with-temp-dir
+    (let* ((source-dir (expand-file-name "source" temp-dir))
+           (target-dir (expand-file-name "target" temp-dir))
+           (referent (expand-file-name "referent" temp-dir)))
+      (make-directory source-dir)
+      (make-directory target-dir)
+      (write-region "content" nil referent)
+      (make-symbolic-link referent (expand-file-name "link" source-dir))
+      (grease-test-with-buffers ((source source-dir) (target target-dir))
+        (grease-test-cut-and-paste source target "link")
+        (let ((grease-skip-confirm-for-simple-edits t))
+          (with-current-buffer target
+            (should (grease-save))))
+        (should-not (file-symlink-p (expand-file-name "link" source-dir)))
+        (should (equal (file-symlink-p (expand-file-name "link" target-dir))
+                       referent))
+        (should (equal (grease-test-read-file referent) "content"))))))
+
+(ert-deftest grease-test-save-cross-directory-relative-symlink-move ()
+  "Moving a relative symlink must rebase it to preserve the same referent."
+  (grease-test-with-temp-dir
+    (let ((source-dir (expand-file-name "source" temp-dir))
+          (target-dir (expand-file-name "target" temp-dir)))
+      (make-directory source-dir)
+      (make-directory target-dir)
+      (write-region "content" nil (expand-file-name "referent" source-dir))
+      (make-symbolic-link "referent" (expand-file-name "link" source-dir))
+      (grease-test-with-buffers ((source source-dir) (target target-dir))
+        (grease-test-cut-and-paste source target "link")
+        (let ((grease-skip-confirm-for-simple-edits t))
+          (with-current-buffer target
+            (should (grease-save))))
+        (should-not (file-symlink-p (expand-file-name "link" source-dir)))
+        (should (equal (file-symlink-p (expand-file-name "link" target-dir))
+                       "../source/referent"))
+        (should (equal (file-truename (expand-file-name "link" target-dir))
+                       (file-truename
+                        (expand-file-name "referent" source-dir))))))))
+
+(ert-deftest grease-test-save-dangling-symlink-copy ()
+  "Copying a dangling symlink in place must preserve its raw target."
+  (grease-test-with-temp-dir
+    (make-symbolic-link "missing" (expand-file-name "broken" temp-dir))
+    (grease-test-with-buffer temp-dir
+      (grease-test-goto-entry "broken")
+      (grease-copy)
+      (grease-paste)
+      (let ((grease-skip-confirm-for-simple-edits t))
+        (should (grease-save)))
+      (should (equal (file-symlink-p (expand-file-name "broken-copy" temp-dir))
+                     "missing")))))
+
+(ert-deftest grease-test-delete-directory-symlink-keeps-target-tree ()
+  "Deleting a directory symlink must never recursively delete its target."
+  (grease-test-with-temp-dir
+    (let ((target (expand-file-name "target-dir" temp-dir))
+          (link (expand-file-name "dir-link" temp-dir)))
+      (make-directory target)
+      (write-region "preserved" nil (expand-file-name "nested.txt" target))
+      (make-symbolic-link "target-dir" link)
+      (grease-test-with-buffer temp-dir
+        (grease-test-goto-entry "dir-link")
+        (grease-cut)
+        (cl-letf (((symbol-function 'read-char-choice)
+                   (lambda (&rest _) ?y)))
+          (should (grease-save)))
+        (should-not (file-symlink-p link))
+        (should (equal (grease-test-read-file
+                        (expand-file-name "nested.txt" target))
+                       "preserved"))))))
+
+(ert-deftest grease-test-symlink-swap-preserves-both-link-targets ()
+  "A relocation cycle must preserve each symlink's raw target."
+  (grease-test-with-temp-dir
+    (let ((first (expand-file-name "first-link" temp-dir))
+          (second (expand-file-name "second-link" temp-dir)))
+      (make-symbolic-link "first-target" first)
+      (make-symbolic-link "second-target" second)
+      (let* ((operations
+              `((:kind relocate :id 1 :src ,first :dst ,second :type file
+                       :entry-kind symlink :link-target "first-target")
+                (:kind relocate :id 2 :src ,second :dst ,first :type file
+                       :entry-kind symlink :link-target "second-target")))
+             (result (grease--execute-transaction
+                      (grease--plan-transaction operations))))
+        (should (plist-get result :success-p)))
+      (should (equal (file-symlink-p first) "second-target"))
+      (should (equal (file-symlink-p second) "first-target")))))
+
+(ert-deftest grease-test-symlink-copy-rejects-external-retarget ()
+  "A copy must stop if its source symlink target changed after planning."
+  (grease-test-with-temp-dir
+    (let ((source (expand-file-name "source-link" temp-dir))
+          (destination (expand-file-name "copy-link" temp-dir)))
+      (make-symbolic-link "first" source)
+      (let ((operation `(:kind copy :id 2 :source-id 1
+                               :src ,source :dst ,destination :type file
+                               :entry-kind symlink :link-target "first")))
+        (delete-file source)
+        (make-symbolic-link "second" source)
+        (let ((result (grease--execute-transaction (list operation))))
+          (should-not (plist-get result :success-p))))
+      (should (equal (file-symlink-p source) "second"))
+      (should-not (file-symlink-p destination)))))
+
+(ert-deftest grease-test-symlink-copy-refuses-dangling-destination ()
+  "A dangling destination symlink must block copy without being overwritten."
+  (grease-test-with-temp-dir
+    (let ((source (expand-file-name "source-link" temp-dir))
+          (destination (expand-file-name "destination-link" temp-dir)))
+      (make-symbolic-link "source-target" source)
+      (make-symbolic-link "destination-target" destination)
+      (let ((result
+             (grease--execute-transaction
+              `((:kind copy :id 2 :source-id 1
+                       :src ,source :dst ,destination :type file
+                       :entry-kind symlink :link-target "source-target")))))
+        (should-not (plist-get result :success-p)))
+      (should (equal (file-symlink-p source) "source-target"))
+      (should (equal (file-symlink-p destination) "destination-target")))))
+
+(ert-deftest grease-test-cross-adapter-symlink-move-failure-keeps-source ()
+  "A failed cross-adapter symlink creation must leave its source intact."
+  (grease-test-with-temp-dir
+    (let ((source (expand-file-name "source-link" temp-dir))
+          (destination (expand-file-name "moved-link" temp-dir)))
+      (make-symbolic-link "target" source)
+      (cl-letf (((symbol-function 'grease--same-filesystem-adapter-p)
+                 (lambda (&rest _) nil))
+                ((symbol-function 'make-symbolic-link)
+                 (lambda (&rest _) (error "injected symlink failure"))))
+        (let ((result
+               (grease--execute-transaction
+                `((:kind relocate :id 1 :src ,source :dst ,destination
+                         :type file :entry-kind symlink
+                         :link-target "target")))))
+          (should-not (plist-get result :success-p))))
+      (should (equal (file-symlink-p source) "target"))
+      (should-not (file-symlink-p destination)))))
+
 ;;;; Symlink Display Tests
 
 (defun grease-test--symlink-overlays ()

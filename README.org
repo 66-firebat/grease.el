@@ -77,6 +77,9 @@ A more complete configuration showing all available options:
   ;; Hidden files
   (setq grease-show-hidden nil)          ; Set to t to show dotfiles by default
 
+  ;; Symlinks
+  (setq grease-show-symlink-targets t)   ; Show display-only resolved targets
+
   ;; Preview window
   (setq grease-preview-window-width 0.4) ; Preview takes 40% of frame width
   (setq grease-preview-writable nil)     ; Set to t to make file previews editable
@@ -194,6 +197,27 @@ Current limitation: transactions that edit an entry inside a directory while
 also relocating one of that entry's ancestor directories are rejected. This
 avoids ambiguous path rebasing and filesystem mutation; perform those changes
 as separate saves instead.
+
+** Symlinks
+Existing symlink targets are shown as display-only text after their filenames.
+Broken targets use the ~grease-symlink-broken~ face.
+
+Copy, duplicate, move, and delete operations act on the symlink itself rather
+than dereferencing its target. Same-directory operations preserve the raw link
+target. For cross-directory copy/move, Grease rebases relative targets so the
+new link continues to resolve to the same referent. Absolute targets remain
+unchanged. Deleting a symlink never recursively deletes its target directory.
+
+Grease rejects symlink copies or moves across different local/remote adapters
+when it cannot preserve the original referent safely.
+
+After visiting a symlink target, ~grease-toggle~ returns to the directory that
+contained the link and selects the link itself. This provenance is window-local,
+so different windows can visit the same target through different links.
+Going up from an entered directory symlink likewise returns to its source link.
+
+Creating or retargeting symlinks through editable Grease syntax is not yet
+implemented.
 
 ** Preview Window
 Toggle a preview window on the right side showing file contents or directory listings:
@@ -356,6 +380,7 @@ Here's an example Doom-style setup:
 | ~grease-sort-method~            | ~'type~   | Default sorting method                   |
 | ~grease-sort-directories-first~ | ~t~       | Show directories before files            |
 | ~grease-show-hidden~            | ~nil~     | Show hidden files by default             |
+| ~grease-show-symlink-targets~   | ~t~       | Show display-only symlink targets        |
 | ~grease-preview-window-width~   | ~0.4~     | Preview window width (fraction of frame) |
 | ~grease-preview-writable~       | ~nil~     | Make file previews editable              |
 
@@ -380,6 +405,8 @@ Here's an example Doom-style setup:
 - [X] Toggleable preview editability for files.
 - [X] Multiple sorting options (type, name, size, date, extension).
 - [X] Hidden files toggle.
+- [X] Display symlink targets without editable buffer text.
+- [X] Preserve symlinks through copy, move, duplicate, and delete operations.
 - [X] Cursor position maintained when sorting/toggling.
 - [X] Nested file creation in new directories
   Example: ~dir1/file.org~ creates ~dir1/~ and then ~file.org~ inside.

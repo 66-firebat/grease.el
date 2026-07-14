@@ -113,8 +113,8 @@ When nil, uses `grease-show-hidden' as default.")
 ;; File tracking system - keeps track of all files by ID
 (defvar grease--file-registry (make-hash-table :test 'eql)
   "Registry of all files seen during the current session.
-Each entry is keyed by unique ID and contains:
-/(:path PATH :type TYPE :committed-p BOOL :source-id ID :exists BOOL)
+Each entry is keyed by unique ID and records path, display type, entry kind,
+raw symlink target, committed state, source identity, and existence.
 `:exists' is retained temporarily for compatibility with the old diff engine.")
 
 ;; Track directories we've visited
@@ -156,13 +156,21 @@ Retained temporarily while the old diff engine is being replaced.")
 
 (defvar-local grease--baseline-by-id nil
   "Committed filesystem snapshot keyed by stable file ID.
-Each value records `:id', original `:path', `:type', and `:committed-p'.")
+Each value records identity, path, type, entry kind, raw link target, and
+committed state.")
 
 (defvar-local grease--buffer-dirty-p nil
   "Non-nil if buffer has unsaved changes.")
 
 (defvar-local grease--change-hook-active nil
   "Flag to prevent recursive change hooks.")
+
+(defvar-local grease--directory-return-stack nil
+  "Stack of source locations for directory symlinks entered in this buffer.")
+
+(defconst grease--return-location-window-parameter
+  'grease-return-location
+  "Window parameter used to return from a visited symlink target.")
 
 ;; List of pending operations to be applied on save
 (defvar-local grease--pending-changes nil
@@ -196,29 +204,55 @@ Each snapshot contains `:root-dir', `:baseline', and desired `:entries'.")
   "Return a short name for the current project root."
   (file-name-nondirectory (directory-file-name (grease--project-root))))
 
-(defun grease--register-file (path type &optional id)
-  "Register PATH of TYPE in registry and return its ID.
-If ID is provided, use that ID instead of generating a new one."
+(defun grease--filesystem-entry-exists-p (path)
+  "Return non-nil when PATH is an existing entry or a dangling symlink."
+  (or (file-exists-p path) (file-symlink-p path)))
+
+(defun grease--filesystem-entry-metadata (path)
+  "Return type and symlink metadata for filesystem entry PATH."
+  (let ((link-target (file-symlink-p path)))
+    (list :type (if (file-directory-p path) 'dir 'file)
+          :entry-kind (if link-target 'symlink
+                        (if (file-directory-p path) 'dir 'file))
+          :link-target link-target)))
+
+(defun grease--register-file (path type &optional id entry-kind link-target)
+  "Register PATH of TYPE in the registry and return its ID.
+ENTRY-KIND distinguishes symlinks from ordinary files/directories, and
+LINK-TARGET is the raw target string.  If ID is provided, reuse it."
   (let* ((abs-path (expand-file-name path))
-         (file-id (or id (cl-incf grease--session-id-counter))))
-    ;; Store in registry
-    (let ((committed-p (file-exists-p abs-path)))
-      (puthash file-id
-               (list :path abs-path
-                     :type type
-                     :committed-p committed-p
-                     :source-id nil
-                     :exists committed-p)
-               grease--file-registry))
+         (metadata (grease--filesystem-entry-metadata abs-path))
+         (file-id (or id (cl-incf grease--session-id-counter)))
+         (committed-p (grease--filesystem-entry-exists-p abs-path)))
+    (puthash file-id
+             (list :path abs-path
+                   :type type
+                   :entry-kind (or entry-kind
+                                   (plist-get metadata :entry-kind)
+                                   type)
+                   :link-target (or link-target
+                                    (plist-get metadata :link-target))
+                   :committed-p committed-p
+                   :source-id nil
+                   :exists committed-p)
+             grease--file-registry)
     file-id))
 
-(defun grease--refresh-file-registration (id path type)
-  "Refresh registry entry ID with current PATH, TYPE, and filesystem existence."
+(defun grease--refresh-file-registration
+    (id path type &optional entry-kind link-target)
+  "Refresh registry entry ID with PATH, TYPE, and symlink metadata."
   (when id
-    (let ((committed-p (file-exists-p path)))
+    (let* ((abs-path (expand-file-name path))
+           (metadata (grease--filesystem-entry-metadata abs-path))
+           (committed-p (grease--filesystem-entry-exists-p abs-path)))
       (puthash id
-               (list :path (expand-file-name path)
+               (list :path abs-path
                      :type type
+                     :entry-kind (or entry-kind
+                                     (plist-get metadata :entry-kind)
+                                     type)
+                     :link-target (or link-target
+                                      (plist-get metadata :link-target))
                      :committed-p committed-p
                      :source-id nil
                      :exists committed-p)
@@ -236,7 +270,7 @@ If ID is provided, use that ID instead of generating a new one."
     (and entry
          path
          (plist-get entry :exists)
-         (file-exists-p path))))
+         (grease--filesystem-entry-exists-p path))))
 
 (defun grease--line-data-real-file-p (data)
   "Return non-nil if DATA represents an existing filesystem entry."
@@ -245,7 +279,8 @@ If ID is provided, use that ID instead of generating a new one."
     (and data
          (not (plist-get data :is-new))
          (or (grease--real-file-id-p id)
-             (and (not id) path (file-exists-p path))))))
+             (and (not id) path
+                  (grease--filesystem-entry-exists-p path))))))
 
 (defun grease--line-data-source-kind (data)
   "Return `file' for existing entries and `text' for pending/new entries."
@@ -273,13 +308,18 @@ If ID is provided, use that ID instead of generating a new one."
              (files (cl-remove-if (lambda (f) (member f '("." ".."))) all-files)))
         (dolist (file files)
           (let* ((abs-path (expand-file-name file abs-dir))
-                 (type (if (file-directory-p abs-path) 'dir 'file))
+                 (metadata (grease--filesystem-entry-metadata abs-path))
+                 (type (plist-get metadata :type))
+                 (entry-kind (plist-get metadata :entry-kind))
+                 (link-target (plist-get metadata :link-target))
                  (existing-id (grease--get-id-by-path abs-path)))
             ;; Register new entries and refresh existing entries, since pending
             ;; creates can become real filesystem entries after save.
             (if existing-id
-                (grease--refresh-file-registration existing-id abs-path type)
-              (grease--register-file abs-path type))))))))
+                (grease--refresh-file-registration
+                 existing-id abs-path type entry-kind link-target)
+              (grease--register-file
+               abs-path type nil entry-kind link-target))))))))
 
 ;;;; Core Helpers
 
@@ -571,10 +611,11 @@ ITEMS is a list of plists with :name, :is-dir, :size, :mtime, :ext keys."
 
 ;;;; Buffer Rendering and Management
 
-(defun grease--insert-entry (id name type &optional source-id is-duplicate)
-  "Insert a formatted line for file with ID, NAME and TYPE.
-SOURCE-ID is the ID of the source file if this is a copy.
-IS-DUPLICATE indicates if this is a copy of another file."
+(defun grease--insert-entry
+    (id name type &optional source-id is-duplicate entry-kind link-target)
+  "Insert a formatted entry with ID, NAME, TYPE, and filesystem metadata.
+SOURCE-ID identifies a copy source.  IS-DUPLICATE marks copied entries.
+ENTRY-KIND is `file', `dir', or `symlink'; LINK-TARGET is raw link text."
   (let* ((is-dir (eq type 'dir))
          (canonical-name (grease--canonical-entry-name name))
          (display-name (if is-dir (concat canonical-name "/") canonical-name))
@@ -586,13 +627,24 @@ IS-DUPLICATE indicates if this is a copy of another file."
     ;; Entries introduced in the editor are desired state, not committed
     ;; filesystem state.  Copies get a new ID and retain their source identity.
     (unless (grease--get-file-by-id id)
-      (puthash id
-               (list :path full-path
-                     :type type
-                     :committed-p nil
-                     :source-id source-id
-                     :exists nil)
-               grease--file-registry))
+      (let* ((source-entry (and source-id
+                                (grease--get-file-by-id source-id)))
+             (effective-kind (or entry-kind
+                                 (and source-entry
+                                      (plist-get source-entry :entry-kind))
+                                 type))
+             (effective-target (or link-target
+                                   (and source-entry
+                                        (plist-get source-entry :link-target)))))
+        (puthash id
+                 (list :path full-path
+                       :type type
+                       :entry-kind effective-kind
+                       :link-target effective-target
+                       :committed-p nil
+                       :source-id source-id
+                       :exists nil)
+                 grease--file-registry)))
 
     ;; Insert hidden ID - invisible but not read-only
     (insert full-id " ")
@@ -615,6 +667,15 @@ IS-DUPLICATE indicates if this is a copy of another file."
                            (list 'grease-id id
                                  'grease-name canonical-name
                                  'grease-type type
+                                 'grease-entry-kind
+                                 (or entry-kind
+                                     (plist-get (grease--get-file-by-id id)
+                                                :entry-kind)
+                                     type)
+                                 'grease-link-target
+                                 (or link-target
+                                     (plist-get (grease--get-file-by-id id)
+                                                :link-target))
                                  'grease-source-id source-id
                                  'grease-is-duplicate is-duplicate
                                  'grease-full-path full-path))
@@ -703,21 +764,26 @@ If target exceeds available files, go to last file line."
            (files (grease--filter-hidden files)))
       (dolist (file (grease--sort-files files grease--root-dir))
         (let* ((abs-path (expand-file-name file grease--root-dir))
-               (type (if (file-directory-p abs-path) 'dir 'file))
+               (metadata (grease--filesystem-entry-metadata abs-path))
+               (type (plist-get metadata :type))
+               (entry-kind (plist-get metadata :entry-kind))
+               (link-target (plist-get metadata :link-target))
                (existing-id (grease--get-id-by-path abs-path)))
-          (progn
-            (puthash (grease--normalize-name file type) type grease--original-state)
-            (when existing-id
-              (grease--refresh-file-registration existing-id abs-path type)
-              (puthash existing-id
-                       (list :id existing-id
-                             :path abs-path
-                             :type type
-                             :committed-p t)
-                       grease--baseline-by-id))
-            (grease--insert-entry
-             (or existing-id (cl-incf grease--session-id-counter))
-             file type nil nil)))))
+          (puthash (grease--normalize-name file type) type grease--original-state)
+          (when existing-id
+            (grease--refresh-file-registration
+             existing-id abs-path type entry-kind link-target)
+            (puthash existing-id
+                     (list :id existing-id
+                           :path abs-path
+                           :type type
+                           :entry-kind entry-kind
+                           :link-target link-target
+                           :committed-p t)
+                     grease--baseline-by-id))
+          (grease--insert-entry
+           (or existing-id (cl-incf grease--session-id-counter))
+           file type nil nil entry-kind link-target))))
 
     ;; Always add one editable line at the end
     (let ((start (point)))
@@ -733,10 +799,14 @@ its target display disappear."
   (let* ((registry-entry (and id (grease--get-file-by-id id)))
          (registry-path (and registry-entry
                              (plist-get registry-entry :path)))
-         (registry-target (and registry-path
-                               (file-symlink-p registry-path)))
-         (source-path (if registry-target registry-path full-path))
-         (link-target (or registry-target (file-symlink-p full-path))))
+         (on-disk-target (and registry-path
+                              (file-symlink-p registry-path)))
+         (stored-target (and (eq (plist-get registry-entry :entry-kind)
+                                 'symlink)
+                             (plist-get registry-entry :link-target)))
+         (link-target (or on-disk-target stored-target
+                          (file-symlink-p full-path)))
+         (source-path (if on-disk-target registry-path full-path)))
     (when link-target
       (let ((resolved (expand-file-name
                        link-target (file-name-directory source-path))))
@@ -857,6 +927,8 @@ This only moves existing overlays and never queries the filesystem."
        ((get-text-property line-beg 'grease-name)
         (list :name (get-text-property line-beg 'grease-name)
               :type (get-text-property line-beg 'grease-type)
+              :entry-kind (get-text-property line-beg 'grease-entry-kind)
+              :link-target (get-text-property line-beg 'grease-link-target)
               :id (get-text-property line-beg 'grease-id)
               :source-id (get-text-property line-beg 'grease-source-id)
               :is-duplicate (get-text-property line-beg 'grease-is-duplicate)
@@ -896,6 +968,8 @@ This only moves existing overlays and never queries the filesystem."
              (types '())
              (ids '())
              (source-kinds '())
+             (entry-kinds '())
+             (link-targets '())
              (paths '()))
         
         ;; Collect all selected files
@@ -909,6 +983,8 @@ This only moves existing overlays and never queries the filesystem."
                 (push (plist-get data :type) types)
                 (push (plist-get data :id) ids)
                 (push (grease--line-data-source-kind data) source-kinds)
+                (push (plist-get data :entry-kind) entry-kinds)
+                (push (plist-get data :link-target) link-targets)
                 (push (grease--get-full-path (plist-get data :name)) paths)))
             (forward-line 1)))
         
@@ -920,6 +996,8 @@ This only moves existing overlays and never queries the filesystem."
                       :types (nreverse types)
                       :ids (nreverse ids)
                       :source-kinds (nreverse source-kinds)
+                      :entry-kinds (nreverse entry-kinds)
+                      :link-targets (nreverse link-targets)
                       :original-dir grease--root-dir))
           (setq grease--last-op-type 'file)
           (setq grease--last-kill-index 0))))
@@ -956,7 +1034,8 @@ Handles both multi-line visual yanks and single-line `yy` yanks."
        ((and (boundp 'evil-state)
              (eq evil-state 'visual)
              (memq (evil-visual-type) '(line block)))
-        (let ((names '()) (types '()) (ids '()) (source-kinds '()) (paths '()))
+        (let ((names '()) (types '()) (ids '()) (source-kinds '())
+              (entry-kinds '()) (link-targets '()) (paths '()))
           (save-excursion
             (goto-char beg)
             (while (< (point) end)
@@ -966,6 +1045,8 @@ Handles both multi-line visual yanks and single-line `yy` yanks."
                   (push (plist-get data :type) types)
                   (push (plist-get data :id) ids)
                   (push (grease--line-data-source-kind data) source-kinds)
+                  (push (plist-get data :entry-kind) entry-kinds)
+                  (push (plist-get data :link-target) link-targets)
                   (push (grease--get-full-path (plist-get data :name)) paths)))
               (forward-line 1)))
           (when names
@@ -975,6 +1056,8 @@ Handles both multi-line visual yanks and single-line `yy` yanks."
                         :types (nreverse types)
                         :ids (nreverse ids)
                         :source-kinds (nreverse source-kinds)
+                        :entry-kinds (nreverse entry-kinds)
+                        :link-targets (nreverse link-targets)
                         :original-dir grease--root-dir
                         :operation 'copy))
             (setq grease--last-op-type 'file
@@ -998,6 +1081,8 @@ Handles both multi-line visual yanks and single-line `yy` yanks."
                           :types (list type)
                           :ids (list id)
                           :source-kinds (list source-kind)
+                          :entry-kinds (list (plist-get data :entry-kind))
+                          :link-targets (list (plist-get data :link-target))
                           :original-dir grease--root-dir
                           :operation 'copy))
               (setq grease--last-op-type 'file
@@ -1017,7 +1102,8 @@ Runs BEFORE Evil's delete (which will also yank)."
      ((and (boundp 'evil-state)
            (eq evil-state 'visual)
            (memq (evil-visual-type) '(line block)))
-      (let ((names '()) (types '()) (ids '()) (source-kinds '()) (paths '()))
+      (let ((names '()) (types '()) (ids '()) (source-kinds '())
+            (entry-kinds '()) (link-targets '()) (paths '()))
         (save-excursion
           (goto-char (region-beginning))
           (let ((end (save-excursion (goto-char (region-end)) (line-end-position))))
@@ -1033,6 +1119,8 @@ Runs BEFORE Evil's delete (which will also yank)."
                     (push type types)
                     (push id ids)
                     (push source-kind source-kinds)
+                    (push (plist-get data :entry-kind) entry-kinds)
+                    (push (plist-get data :link-target) link-targets)
                     (push path paths)
                     )))
               (forward-line 1))))
@@ -1042,6 +1130,8 @@ Runs BEFORE Evil's delete (which will also yank)."
                     :types (nreverse types)
                     :ids   (nreverse ids)
                     :source-kinds (nreverse source-kinds)
+                    :entry-kinds (nreverse entry-kinds)
+                    :link-targets (nreverse link-targets)
                     :original-dir grease--root-dir
                     :operation 'cut))
         (setq grease--last-op-type 'cut)
@@ -1065,6 +1155,8 @@ Runs BEFORE Evil's delete (which will also yank)."
                         :types (list type)
                         :ids   (list id)
                         :source-kinds (list source-kind)
+                        :entry-kinds (list (plist-get data :entry-kind))
+                        :link-targets (list (plist-get data :link-target))
                         :original-dir grease--root-dir
                         :operation 'cut))
             (setq grease--last-op-type 'cut)
@@ -1099,6 +1191,8 @@ Runs BEFORE Evil's delete (which will also yank)."
         (list :id id
               :name name
               :type type
+              :entry-kind (plist-get file-info :entry-kind)
+              :link-target (plist-get file-info :link-target)
               :path (plist-get file-info :path))))))
 
 (defun grease--intercept-yanked-text (text)
@@ -1117,6 +1211,8 @@ Runs BEFORE Evil's delete (which will also yank)."
                 (list :paths (list (plist-get info :path))
                       :names (list (plist-get info :name))
                       :types (list (plist-get info :type))
+                      :entry-kinds (list (plist-get info :entry-kind))
+                      :link-targets (list (plist-get info :link-target))
                       :ids   (list (plist-get info :id))
                       :source-kinds (list (if (grease--real-file-id-p (plist-get info :id))
                                               'file
@@ -1135,6 +1231,12 @@ Runs BEFORE Evil's delete (which will also yank)."
            (clipboard-id (and grease--clipboard (car (plist-get grease--clipboard :ids))))
            (clipboard-name (and grease--clipboard (car (plist-get grease--clipboard :names))))
            (clipboard-type (and grease--clipboard (car (plist-get grease--clipboard :types))))
+           (clipboard-entry-kind
+            (and grease--clipboard
+                 (car (plist-get grease--clipboard :entry-kinds))))
+           (clipboard-link-target
+            (and grease--clipboard
+                 (car (plist-get grease--clipboard :link-targets))))
            (id-from-text (grease--extract-id line-text)))
 
       ;; Clear the current line content before inserting the new entry
@@ -1144,7 +1246,9 @@ Runs BEFORE Evil's delete (which will also yank)."
         ;; Case 1: CUT or MOVE operation (clipboard is authoritative)
         ((memq clipboard-op '(cut move))
         ;; Use original ID and metadata from clipboard
-        (grease--insert-entry clipboard-id clipboard-name clipboard-type nil nil))
+        (grease--insert-entry
+         clipboard-id clipboard-name clipboard-type nil nil
+         clipboard-entry-kind clipboard-link-target))
 
        ;; Case 2: COPY with ID in pasted text
        (id-from-text
@@ -1155,7 +1259,11 @@ Runs BEFORE Evil's delete (which will also yank)."
           ;; Existing entries paste as copies. Pending/new entries paste as
           ;; fresh creates, just like typing the filename by hand.
           (if (grease--real-file-id-p source-id)
-              (grease--insert-entry (grease--get-next-id) name type source-id t)
+              (let ((source-entry (grease--get-file-by-id source-id)))
+                (grease--insert-entry
+                 (grease--get-next-id) name type source-id t
+                 (plist-get source-entry :entry-kind)
+                 (plist-get source-entry :link-target)))
             (grease--insert-entry (grease--get-next-id) name type nil nil))))
 
        ;; Case 3: Plain text (new file)
@@ -1380,15 +1488,32 @@ Runs BEFORE Evil's delete (which will also yank)."
                    (source-entry
                     (and effective-source-id
                          (grease--get-file-by-id effective-source-id)))
+                   (entry-kind
+                    (or (plist-get line-data :entry-kind)
+                        (and registry-entry
+                             (plist-get registry-entry :entry-kind))
+                        type))
+                   (link-target
+                    (or (plist-get line-data :link-target)
+                        (and registry-entry
+                             (plist-get registry-entry :link-target))))
                    (data (list :name name
                                :path full-path
                                :type type
+                               :entry-kind entry-kind
+                               :link-target link-target
                                :id id
                                :committed-p (and registry-entry
                                                  (plist-get registry-entry :committed-p))
                                :source-id effective-source-id
                                :source-path (and source-entry
                                                  (plist-get source-entry :path))
+                               :source-entry-kind
+                               (and source-entry
+                                    (plist-get source-entry :entry-kind))
+                               :source-link-target
+                               (and source-entry
+                                    (plist-get source-entry :link-target))
                                :source-committed-p
                                (and source-entry
                                     (plist-get source-entry :committed-p))
@@ -1557,6 +1682,18 @@ Return a list of conflicting names."
           (puthash name (1+ count) names))))
     (cl-remove-duplicates conflicts :test #'equal)))
 
+(defun grease--symlink-operation-metadata (&rest entries)
+  "Return operation metadata when one of ENTRIES represents a symlink."
+  (let ((symlink-entry
+         (cl-find-if (lambda (entry)
+                       (eq (plist-get entry :entry-kind) 'symlink))
+                     entries))
+        (link-target (cl-some (lambda (entry)
+                                (plist-get entry :link-target))
+                              entries)))
+    (when symlink-entry
+      (list :entry-kind 'symlink :link-target link-target))))
+
 (defun grease--diff-by-id (baseline current-entries)
   "Return semantic operations between BASELINE and CURRENT-ENTRIES.
 BASELINE is a hash table keyed by stable file ID.  This function is pure:
@@ -1573,18 +1710,22 @@ it reads only its arguments and never examines or mutates the filesystem."
        (let ((current (gethash id current-by-id)))
          (cond
           ((not current)
-           (push (list :kind 'delete
-                       :id id
-                       :src (plist-get original :path)
-                       :type (plist-get original :type))
+           (push (append
+                  (list :kind 'delete
+                        :id id
+                        :src (plist-get original :path)
+                        :type (plist-get original :type))
+                  (grease--symlink-operation-metadata original))
                  operations))
           ((not (equal (plist-get original :path)
                        (plist-get current :path)))
-           (push (list :kind 'relocate
-                       :id id
-                       :src (plist-get original :path)
-                       :dst (plist-get current :path)
-                       :type (plist-get current :type))
+           (push (append
+                  (list :kind 'relocate
+                        :id id
+                        :src (plist-get original :path)
+                        :dst (plist-get current :path)
+                        :type (plist-get current :type))
+                  (grease--symlink-operation-metadata current original))
                  operations)))))
      baseline)
 
@@ -1602,17 +1743,26 @@ it reads only its arguments and never examines or mutates the filesystem."
                            (plist-get source-baseline :committed-p))
                       (plist-get entry :source-committed-p))))
             (if (and source-id source-path source-committed-p)
-                (push (list :kind 'copy
-                            :id id
-                            :source-id source-id
-                            :src source-path
-                            :dst (plist-get entry :path)
-                            :type (plist-get entry :type))
+                (push (append
+                       (list :kind 'copy
+                             :id id
+                             :source-id source-id
+                             :src source-path
+                             :dst (plist-get entry :path)
+                             :type (plist-get entry :type))
+                       (grease--symlink-operation-metadata
+                        entry source-baseline
+                        (list :entry-kind
+                              (plist-get entry :source-entry-kind)
+                              :link-target
+                              (plist-get entry :source-link-target))))
                       operations)
-              (push (list :kind 'create
-                          :id id
-                          :dst (plist-get entry :path)
-                          :type (plist-get entry :type))
+              (push (append
+                     (list :kind 'create
+                           :id id
+                           :dst (plist-get entry :path)
+                           :type (plist-get entry :type))
+                     (grease--symlink-operation-metadata entry))
                     operations))))))
     (nreverse operations)))
 
@@ -1786,6 +1936,45 @@ paths or authoritative states signal `user-error' before any mutation."
   (pcase (plist-get operation :kind)
     ((or 'create 'copy 'relocate) (plist-get operation :dst))))
 
+(defun grease--operation-entry-kind (operation)
+  "Return OPERATION's filesystem entry kind."
+  (or (plist-get operation :entry-kind)
+      (plist-get operation :type)))
+
+(defun grease--absolute-symlink-target-p (target)
+  "Return non-nil when raw symlink TARGET is filesystem-absolute."
+  (or (string-prefix-p "/" target)
+      (string-match-p "\\`[[:alpha:]]:[/\\\\]" target)))
+
+(defun grease--symlink-target-for-destination (src dst target)
+  "Return raw TARGET rebased from SRC to DST while preserving its referent."
+  (if (grease--absolute-symlink-target-p target)
+      target
+    (file-relative-name
+     (expand-file-name target (file-name-directory src))
+     (file-name-directory dst))))
+
+(defun grease--prepare-symlink-destination-targets (operations)
+  "Annotate symlink OPERATIONS with destination-relative target strings."
+  (mapcar
+   (lambda (operation)
+     (let ((prepared (copy-tree operation)))
+       (when (and (eq (grease--operation-entry-kind prepared) 'symlink)
+                  (memq (plist-get prepared :kind) '(copy relocate)))
+         (unless (plist-get prepared :link-target)
+           (user-error "Symlink operation has no target: %S" prepared))
+         (unless (grease--same-filesystem-adapter-p
+                  (plist-get prepared :src) (plist-get prepared :dst))
+           (user-error "Cannot preserve symlink referent across adapters: %s"
+                       (plist-get prepared :src)))
+         (setf (plist-get prepared :destination-link-target)
+               (grease--symlink-target-for-destination
+                (plist-get prepared :src)
+                (plist-get prepared :dst)
+                (plist-get prepared :link-target))))
+       prepared))
+   operations))
+
 (defun grease--normalize-operation-paths (semantic-operations)
   "Return a copy of SEMANTIC-OPERATIONS with canonical source and destination paths."
   (mapcar
@@ -1812,7 +2001,7 @@ paths or authoritative states signal `user-error' before any mutation."
       (when-let ((dst (grease--operation-destination operation)))
         (puthash dst operation destinations)
         (when (and (memq (plist-get operation :kind) '(create relocate))
-                   (eq (plist-get operation :type) 'dir))
+                   (eq (grease--operation-entry-kind operation) 'dir))
           (puthash dst operation providers))))
     (dolist (operation semantic-operations)
       (when-let ((dst (grease--operation-destination operation)))
@@ -1827,7 +2016,7 @@ paths or authoritative states signal `user-error' before any mutation."
               (user-error "Destination ancestor is not a directory: %s" parent))
             (when-let ((claim (gethash parent destinations)))
               (unless (and (memq (plist-get claim :kind) '(create relocate))
-                           (eq (plist-get claim :type) 'dir))
+                           (eq (grease--operation-entry-kind claim) 'dir))
                 (user-error "Scheduled destination ancestor is not a directory: %s"
                             parent)))
             (unless (gethash parent needed)
@@ -1910,12 +2099,14 @@ RESERVED-PATHS contains every transaction source and destination."
              (temporary-path
               (grease--temporary-cycle-path breaker reserved)))
         (puthash temporary-path t reserved)
-        (push (list :kind 'relocate
-                    :id (plist-get breaker :id)
-                    :src original-src
-                    :dst temporary-path
-                    :type (plist-get breaker :type)
-                    :temporary-p t)
+        (push (append
+               (list :kind 'relocate
+                     :id (plist-get breaker :id)
+                     :src original-src
+                     :dst temporary-path
+                     :type (plist-get breaker :type)
+                     :temporary-p t)
+               (grease--symlink-operation-metadata breaker))
               temporary-operations)
         (setf (plist-get breaker :src) temporary-path)))
     (append (nreverse temporary-operations) operations)))
@@ -1923,9 +2114,10 @@ RESERVED-PATHS contains every transaction source and destination."
 (defun grease--plan-transaction (semantic-operations)
   "Validate and safely order SEMANTIC-OPERATIONS, breaking relocation cycles."
   (let* ((operations
-          (grease--break-relocation-cycles
-           (grease--expand-parent-directory-creates
-            (grease--normalize-operation-paths semantic-operations))))
+          (grease--prepare-symlink-destination-targets
+           (grease--break-relocation-cycles
+            (grease--expand-parent-directory-creates
+             (grease--normalize-operation-paths semantic-operations)))))
          (sources (make-hash-table :test 'equal))
          (destinations (make-hash-table :test 'equal))
          (creates (make-hash-table :test 'equal))
@@ -1942,7 +2134,7 @@ RESERVED-PATHS contains every transaction source and destination."
               (cl-find-if
                (lambda (operation)
                  (and (eq (plist-get operation :kind) 'relocate)
-                      (eq (plist-get operation :type) 'dir)
+                      (eq (grease--operation-entry-kind operation) 'dir)
                       (equal (plist-get operation :dst) directory)))
                operations))))
 
@@ -1967,7 +2159,7 @@ RESERVED-PATHS contains every transaction source and destination."
           (when (eq kind 'create)
             (puthash dst operation creates))
           (when (and (eq kind 'relocate)
-                     (eq (plist-get operation :type) 'dir)
+                     (eq (grease--operation-entry-kind operation) 'dir)
                      (or (equal src dst)
                          (file-in-directory-p dst
                                               (file-name-as-directory src))))
@@ -1976,7 +2168,7 @@ RESERVED-PATHS contains every transaction source and destination."
       ;; Reject ambiguous edits below a directory that is itself relocating.
       (dolist (ancestor operations)
         (when (and (eq (plist-get ancestor :kind) 'relocate)
-                   (eq (plist-get ancestor :type) 'dir))
+                   (eq (grease--operation-entry-kind ancestor) 'dir))
           (let ((ancestor-src (file-name-as-directory
                                (plist-get ancestor :src))))
             (dolist (operation operations)
@@ -2042,22 +2234,39 @@ RESERVED-PATHS contains every transaction source and destination."
             (push ready ordered)))
         (nreverse ordered)))))
 
-(defun grease--copy-path-without-overwrite (src dst)
-  "Copy SRC to DST, refusing to overwrite any existing destination."
+(defun grease--copy-path-without-overwrite
+    (src dst &optional entry-kind link-target destination-link-target)
+  "Copy SRC to DST without overwrite while preserving symlink semantics.
+LINK-TARGET is the expected source target.  DESTINATION-LINK-TARGET is the
+possibly rebased raw target to create at DST."
   (when (grease--path-occupied-p dst)
     (error "Destination already exists: %s" dst))
   (unless (file-directory-p (file-name-directory dst))
     (error "Destination parent does not exist: %s"
            (file-name-directory dst)))
-  (if (file-directory-p src)
-      (copy-directory src dst nil nil t)
-    (copy-file src dst nil)))
+  (if (or (eq entry-kind 'symlink) (file-symlink-p src))
+      (let ((actual-target (file-symlink-p src)))
+        (unless actual-target
+          (error "Symlink source no longer exists: %s" src))
+        (when (and link-target (not (equal link-target actual-target)))
+          (error "Symlink target changed externally: %s" src))
+        (unless (grease--same-filesystem-adapter-p src dst)
+          (error "Cannot preserve symlink referent across adapters: %s" src))
+        (make-symbolic-link
+         (or destination-link-target
+             (grease--symlink-target-for-destination src dst actual-target))
+         dst nil))
+    (if (file-directory-p src)
+        (copy-directory src dst nil nil t)
+      (copy-file src dst nil))))
 
-(defun grease--delete-path (path)
-  "Delete file or directory PATH."
-  (if (file-directory-p path)
-      (delete-directory path t)
-    (delete-file path)))
+(defun grease--delete-path (path &optional entry-kind)
+  "Delete PATH itself according to ENTRY-KIND, never a symlink referent."
+  (if (or (eq entry-kind 'symlink) (file-symlink-p path))
+      (delete-file path)
+    (if (file-directory-p path)
+        (delete-directory path t)
+      (delete-file path))))
 
 (defun grease--execute-operation (operation)
   "Execute one planned semantic OPERATION without overwriting destinations."
@@ -2071,25 +2280,52 @@ RESERVED-PATHS contains every transaction source and destination."
        (unless (file-directory-p (file-name-directory dst))
          (error "Destination parent does not exist: %s"
                 (file-name-directory dst)))
-       (if (eq (plist-get operation :type) 'dir)
-           (make-directory dst nil)
-         (write-region "" nil dst nil 'silent nil t)))
+       (pcase (grease--operation-entry-kind operation)
+         ('symlink
+          (unless (plist-get operation :link-target)
+            (error "Symlink creation has no target: %s" dst))
+          (make-symbolic-link (plist-get operation :link-target) dst nil))
+         ('dir (make-directory dst nil))
+         (_ (write-region "" nil dst nil 'silent nil t))))
       ('copy
-       (grease--copy-path-without-overwrite src dst))
+       (grease--copy-path-without-overwrite
+        src dst
+        (grease--operation-entry-kind operation)
+        (plist-get operation :link-target)
+        (plist-get operation :destination-link-target)))
       ('relocate
+       (when (eq (grease--operation-entry-kind operation) 'symlink)
+         (let ((actual-target (file-symlink-p src))
+               (expected-target (plist-get operation :link-target)))
+           (unless actual-target
+             (error "Symlink source no longer exists: %s" src))
+           (when (and expected-target
+                      (not (equal expected-target actual-target)))
+             (error "Symlink target changed externally: %s" src))))
        (when (grease--path-occupied-p dst)
          (error "Destination already exists: %s" dst))
        (unless (file-directory-p (file-name-directory dst))
          (error "Destination parent does not exist: %s"
                 (file-name-directory dst)))
-       (if (grease--same-filesystem-adapter-p src dst)
-           (rename-file src dst nil)
-         ;; Cross-filesystem relocation is copy-then-delete.  The source is
-         ;; retained if copying fails.
-         (grease--copy-path-without-overwrite src dst)
-         (grease--delete-path src)))
+       (let* ((entry-kind (grease--operation-entry-kind operation))
+              (destination-target
+               (plist-get operation :destination-link-target))
+              (rebase-symlink-p
+               (and (eq entry-kind 'symlink)
+                    (not (equal (plist-get operation :link-target)
+                                destination-target)))))
+         (if (and (grease--same-filesystem-adapter-p src dst)
+                  (not rebase-symlink-p))
+             (rename-file src dst nil)
+           ;; Rebased and cross-adapter relocations create the destination
+           ;; first.  The source remains recoverable if creation fails.
+           (grease--copy-path-without-overwrite
+            src dst entry-kind
+            (plist-get operation :link-target)
+            destination-target)
+           (grease--delete-path src entry-kind))))
       ('delete
-       (grease--delete-path src))
+       (grease--delete-path src (grease--operation-entry-kind operation)))
       (_ (error "Unknown filesystem operation kind %S" kind)))))
 
 (defun grease--execute-transaction (plan)
@@ -2128,14 +2364,23 @@ state is cleared here; the save coordinator owns transaction commit state."
      (list :kind 'create :dst (directory-file-name path)
            :type (if (string-suffix-p "/" path) 'dir 'file)))
     (`(:delete ,path)
-     (list :kind 'delete :src path
-           :type (if (file-directory-p path) 'dir 'file)))
+     (let ((metadata (grease--filesystem-entry-metadata path)))
+       (list :kind 'delete :src path
+             :type (plist-get metadata :type)
+             :entry-kind (plist-get metadata :entry-kind)
+             :link-target (plist-get metadata :link-target))))
     ((or `(:rename ,src ,dst) `(:move ,src ,dst))
-     (list :kind 'relocate :src src :dst dst
-           :type (if (file-directory-p src) 'dir 'file)))
+     (let ((metadata (grease--filesystem-entry-metadata src)))
+       (list :kind 'relocate :src src :dst dst
+             :type (plist-get metadata :type)
+             :entry-kind (plist-get metadata :entry-kind)
+             :link-target (plist-get metadata :link-target))))
     (`(:copy ,src ,dst)
-     (list :kind 'copy :src src :dst dst
-           :type (if (file-directory-p src) 'dir 'file)))
+     (let ((metadata (grease--filesystem-entry-metadata src)))
+       (list :kind 'copy :src src :dst dst
+             :type (plist-get metadata :type)
+             :entry-kind (plist-get metadata :entry-kind)
+             :link-target (plist-get metadata :link-target))))
     (_ (error "Unknown legacy filesystem change %S" change))))
 
 (defun grease--apply-changes (changes)
@@ -2250,6 +2495,8 @@ be used.  Timers do not reliably run with the Grease buffer current."
             (when data
               (let* ((name (plist-get data :name))
                      (type (plist-get data :type))
+                     (entry-kind (plist-get data :entry-kind))
+                     (link-target (plist-get data :link-target))
                      (path (grease--get-full-path name))
                      (preview-buffer grease--preview-buffer)
                      (preview-writable grease-preview-writable)
@@ -2282,6 +2529,10 @@ be used.  Timers do not reliably run with the Grease buffer current."
                         (grease--render-preview-directory path))
                        (is-file
                         (grease--render-preview-file path))
+                       ((and (eq entry-kind 'symlink)
+                             (not (file-exists-p path)))
+                        (insert (format "Broken symlink: %s\nTarget: %s"
+                                        name link-target)))
                        ((not (file-exists-p path))
                         (insert (format "New file: %s\n\n(File will be created on save)" name)))
                        (t
@@ -2343,6 +2594,66 @@ be used.  Timers do not reliably run with the Grease buffer current."
 
 ;;;; User Commands
 
+(defun grease--make-return-location (data)
+  "Build a return-location record for symlink entry DATA."
+  (list :dir grease--root-dir
+        :entry-name (plist-get data :name)
+        :entry-path (plist-get data :full-path)
+        :entry-id (plist-get data :id)))
+
+(defun grease--resolve-return-location (location)
+  "Resolve LOCATION to an existing source entry, or return nil."
+  (when location
+    (let* ((id (plist-get location :entry-id))
+           (registry-entry (and id (grease--get-file-by-id id)))
+           (registry-path
+            (and (eq (plist-get registry-entry :entry-kind) 'symlink)
+                 (plist-get registry-entry :path)))
+           (recorded-path (plist-get location :entry-path))
+           (path (cond
+                  ((and registry-path (file-symlink-p registry-path))
+                   registry-path)
+                  ((and recorded-path (file-symlink-p recorded-path))
+                   recorded-path))))
+      (when path
+        (list :dir (file-name-as-directory (file-name-directory path))
+              :entry-name (file-name-nondirectory path)
+              :entry-path path
+              :entry-id id)))))
+
+(defun grease--window-return-location (&optional window)
+  "Return valid symlink provenance for WINDOW's current destination buffer."
+  (let* ((window (or window (selected-window)))
+         (location (window-parameter
+                    window grease--return-location-window-parameter))
+         (destination-buffer (plist-get location :destination-buffer)))
+    (cond
+     ((not location) nil)
+     ((not (eq destination-buffer (window-buffer window)))
+      (set-window-parameter
+       window grease--return-location-window-parameter nil)
+      nil)
+     (t
+      (or (grease--resolve-return-location location)
+          (progn
+            (set-window-parameter
+             window grease--return-location-window-parameter nil)
+            nil))))))
+
+(defun grease--set-window-return-location (window location destination-buffer)
+  "Record LOCATION for DESTINATION-BUFFER on WINDOW."
+  (when (window-live-p window)
+    (set-window-parameter
+     window grease--return-location-window-parameter
+     (append location (list :destination-buffer destination-buffer)))))
+
+(defun grease--clear-window-return-location (&optional window)
+  "Clear Grease symlink provenance from WINDOW."
+  (let ((window (or window (selected-window))))
+    (when (window-live-p window)
+      (set-window-parameter
+       window grease--return-location-window-parameter nil))))
+
 (defun grease--commit-registry-operations (operations)
   "Commit successful semantic OPERATIONS to the global identity registry."
   (dolist (operation operations)
@@ -2356,6 +2667,11 @@ be used.  Timers do not reliably run with the Grease buffer current."
              (puthash id
                       (list :path (plist-get operation :dst)
                             :type (plist-get operation :type)
+                            :entry-kind
+                            (grease--operation-entry-kind operation)
+                            :link-target
+                            (or (plist-get operation :destination-link-target)
+                                (plist-get operation :link-target))
                             :committed-p t
                             :source-id nil
                             :exists t)
@@ -2528,6 +2844,8 @@ editing or discard all staged Grease-buffer changes."
                 (list :paths (list path)
                       :names (list name)
                       :types (list type)
+                      :entry-kinds (list (plist-get data :entry-kind))
+                      :link-targets (list (plist-get data :link-target))
                       :ids (list id)
                       :source-kinds (list source-kind)
                       :original-dir grease--root-dir
@@ -2557,6 +2875,8 @@ editing or discard all staged Grease-buffer changes."
               (list :paths (list path)
                     :names (list name)
                     :types (list type)
+                    :entry-kinds (list (plist-get data :entry-kind))
+                    :link-targets (list (plist-get data :link-target))
                     :ids (list id)
                     :source-kinds (list (grease--line-data-source-kind data))
                     :original-dir grease--root-dir
@@ -2577,10 +2897,16 @@ editing or discard all staged Grease-buffer changes."
            (paths        (plist-get grease--clipboard :paths))
            (names        (plist-get grease--clipboard :names))
            (types        (plist-get grease--clipboard :types))
+           (entry-kinds  (or (plist-get grease--clipboard :entry-kinds)
+                             types))
+           (link-targets (or (plist-get grease--clipboard :link-targets)
+                             (make-list (length names) nil)))
            (ids          (plist-get grease--clipboard :ids))
            (source-kinds (or (plist-get grease--clipboard :source-kinds)
                              (mapcar (lambda (path)
-                                       (if (file-exists-p path) 'file 'text))
+                                       (if (grease--filesystem-entry-exists-p path)
+                                           'file
+                                         'text))
                                      paths)))
            (original-dir (plist-get grease--clipboard :original-dir))
            (is-cross-dir (not (string= original-dir grease--root-dir)))
@@ -2598,7 +2924,9 @@ editing or discard all staged Grease-buffer changes."
       ;; Insert all entries sequentially with no extra blank lines.
       (cl-loop for name in names
                for type in types
-               for id   in ids
+               for entry-kind in entry-kinds
+               for link-target in link-targets
+               for id in ids
                for source-kind in source-kinds
                do
                (let* ((next-id     (grease--get-next-id))
@@ -2616,14 +2944,17 @@ editing or discard all staged Grease-buffer changes."
                                      name)))
                  (cond
                   (copying
-                   (grease--insert-entry next-id target-name type id t))
+                   (grease--insert-entry
+                    next-id target-name type id t entry-kind link-target))
                   (moving
-                   ;; Keep same ID for cut/move
-                   (grease--insert-entry id name type nil nil))
+                   ;; Keep same ID and filesystem metadata for cut/move.
+                   (grease--insert-entry
+                    id name type nil nil entry-kind link-target))
                   (creating
                    (grease--insert-entry next-id name type nil nil))
                   (t
-                   (grease--insert-entry next-id name type nil nil)))))
+                   (grease--insert-entry
+                    next-id name type nil nil entry-kind link-target)))))
 
       ;; Update state
       (setq grease--last-op-type 'file)
@@ -2650,32 +2981,61 @@ editing or discard all staged Grease-buffer changes."
         (user-error "Not on a file or directory line.")
       (let* ((name (plist-get data :name))
              (type (plist-get data :type))
-             (path (grease--get-full-path name)))
+             (entry-kind (plist-get data :entry-kind))
+             (path (grease--get-full-path name))
+             (symlink-p (eq entry-kind 'symlink))
+             (return-location (and symlink-p
+                                   (grease--make-return-location data))))
         (if (eq type 'dir)
             (progn
               ;; Store an identity-based directory snapshot before moving.
               (when grease--buffer-dirty-p
                 (grease--stage-current-directory))
+              (when symlink-p
+                (push (append return-location
+                              (list :visited-root
+                                    (file-name-as-directory path)))
+                      grease--directory-return-stack))
               (grease--render path t)
               ;; Restore cursor position, clamped to valid lines
               (grease--goto-line-clamped current-line))
           (grease--with-commit-prompt
            (lambda ()
-             (kill-buffer (current-buffer))
-             (find-file path))))))))
+             (let* ((window (selected-window))
+                    (grease-buffer (current-buffer))
+                    (registry-entry (grease--get-file-by-id
+                                     (plist-get data :id)))
+                    (visit-path (or (plist-get registry-entry :path) path)))
+               (kill-buffer grease-buffer)
+               (find-file visit-path)
+               (if symlink-p
+                   (grease--set-window-return-location
+                    window return-location (current-buffer))
+                 (grease--clear-window-return-location window))))))))))
 
 (defun grease-up-directory ()
-  "Move to the parent directory, placing cursor on the directory just exited."
+  "Move to the parent directory, returning through directory symlinks safely."
   (interactive)
   (grease--save-position)
-  (let* ((child-dir (directory-file-name grease--root-dir))
-         (child-name (file-name-nondirectory child-dir))
-         (parent-dir (expand-file-name ".." grease--root-dir)))
-    ;; Store an identity-based directory snapshot before moving.
-    (when grease--buffer-dirty-p
-      (grease--stage-current-directory))
-    (grease--render parent-dir t)
-    (grease--goto-file child-name)))
+  (let* ((return-location (car grease--directory-return-stack))
+         (visited-root (plist-get return-location :visited-root)))
+    (if (and visited-root
+             (equal (directory-file-name grease--root-dir)
+                    (directory-file-name visited-root)))
+        (progn
+          (when grease--buffer-dirty-p
+            (grease--stage-current-directory))
+          (pop grease--directory-return-stack)
+          (grease--render (plist-get return-location :dir) t)
+          (grease--goto-file (plist-get return-location :entry-name)))
+      (let* ((child-dir (directory-file-name grease--root-dir))
+             (child-name (file-name-nondirectory child-dir))
+             (parent-dir (expand-file-name ".." grease--root-dir)))
+        ;; Store an identity-based directory snapshot before moving.
+        (when grease--buffer-dirty-p
+          (grease--stage-current-directory))
+        (grease--render parent-dir t)
+        (grease--goto-file child-name)))))
 
 (defun grease-refresh ()
   "Discard all changes and reload the directory from disk."
@@ -2961,42 +3321,52 @@ If TARGET-FILE is provided, position cursor on it."
 
 ;;;###autoload
 (defun grease-toggle ()
-  "Toggle Grease buffer for the current project.
-If already open, quit (saving position). Otherwise open in current directory.
-If called from a preview buffer, close the associated grease buffer.
-If the current directory does not exist, traverse up to find the first valid one."
+  "Toggle Grease, preferring a recorded symlink source when available.
+If already open, quit and preserve the destination window's return location.
+If the current directory does not exist, traverse to an existing parent."
   (interactive)
-  (let* ((proj-root (file-name-as-directory (expand-file-name (grease--project-root))))
-         (proj-name (grease--project-name))
-         (bufname   (format "*grease:%s*" proj-name))
+  (let* ((proj-name (grease--project-name))
          (preview-bufname (format "*grease-preview:%s*" proj-name))
-         (start-dir (expand-file-name default-directory))
-         (valid-dir start-dir))
-
-    ;; If we're in the preview buffer, switch to grease buffer and quit
-    (when (string= (buffer-name) preview-bufname)
-      (let ((grease-buf (cl-find-if (lambda (b) 
-                                      (with-current-buffer b 
-                                        (derived-mode-p 'grease-mode)))
-                                    (buffer-list))))
-        (when grease-buf
-          (switch-to-buffer grease-buf)
-          (grease-quit))
-        (cl-return-from grease-toggle)))
-
-    ;; Find nearest existing parent directory
-    (while (and (not (file-exists-p valid-dir))
-                (not (string= valid-dir "/"))
-                (not (string= (directory-file-name valid-dir) valid-dir))) ;; Break if no change
-      (setq valid-dir (file-name-directory (directory-file-name valid-dir))))
-
-    (let ((target-file (if (string= start-dir valid-dir)
-                           (when buffer-file-name (file-name-nondirectory buffer-file-name))
-                         nil)))
-
-      (if (derived-mode-p 'grease-mode)
-          (grease-quit)
-        (grease-open valid-dir target-file)))))
+         (preview-p (string= (buffer-name) preview-bufname))
+         (return-location (and (not preview-p)
+                               (not (derived-mode-p 'grease-mode))
+                               (grease--window-return-location))))
+    (cond
+     (preview-p
+      (when-let ((grease-buffer
+                  (cl-find-if
+                   (lambda (buffer)
+                     (with-current-buffer buffer
+                       (derived-mode-p 'grease-mode)))
+                   (buffer-list))))
+        (switch-to-buffer grease-buffer)
+        (grease-quit)))
+     ((derived-mode-p 'grease-mode)
+      (let ((window (selected-window))
+            (grease-buffer (current-buffer))
+            (directory-return (car grease--directory-return-stack)))
+        (grease-quit)
+        (when (and directory-return
+                   (not (buffer-live-p grease-buffer))
+                   (window-live-p window))
+          (grease--set-window-return-location
+           window directory-return (window-buffer window)))))
+     (return-location
+      (grease-open (plist-get return-location :dir)
+                   (plist-get return-location :entry-name)))
+     (t
+      (let* ((start-dir (expand-file-name default-directory))
+             (valid-dir start-dir))
+        ;; Find the nearest existing parent directory.
+        (while (and (not (file-exists-p valid-dir))
+                    (not (string= valid-dir "/"))
+                    (not (string= (directory-file-name valid-dir) valid-dir)))
+          (setq valid-dir
+                (file-name-directory (directory-file-name valid-dir))))
+        (grease-open
+         valid-dir
+         (when (and (string= start-dir valid-dir) buffer-file-name)
+           (file-name-nondirectory buffer-file-name))))))))
 
 ;;;###autoload
 (defun grease-here ()
