@@ -824,7 +824,7 @@ single backspace does not remove its display."
   (when (and grease-show-symlink-targets (< name-start name-end))
     (when-let ((data (grease--symlink-display-data id full-path)))
       (let* ((suffix (propertize
-                      (concat "  " (plist-get data :resolved))
+                      (concat " 󰔰 " (plist-get data :resolved))
                       'face (plist-get data :face)))
              (overlay (make-overlay name-start name-end)))
         ;; Prevent Emacs from drawing point at the far end of virtual text.
@@ -958,7 +958,7 @@ This only moves existing overlays and never queries the filesystem."
   (when (derived-mode-p 'grease-mode)
     (cond
      ;; Multi-line selection in visual mode
-     ((and (boundp 'evil-state) 
+     ((and (boundp 'evil-state)
            (eq evil-state 'visual)
            (memq (evil-visual-type) '(line block)))
       (let* ((beg (line-number-at-pos (region-beginning)))
@@ -971,7 +971,7 @@ This only moves existing overlays and never queries the filesystem."
              (entry-kinds '())
              (link-targets '())
              (paths '()))
-        
+
         ;; Collect all selected files
         (save-excursion
           (goto-char (region-beginning))
@@ -987,7 +987,7 @@ This only moves existing overlays and never queries the filesystem."
                 (push (plist-get data :link-target) link-targets)
                 (push (grease--get-full-path (plist-get data :name)) paths)))
             (forward-line 1)))
-        
+
         ;; Store the multi-line selection data if we found files
         (when names
           (setq grease--multi-line-selection
@@ -1001,7 +1001,7 @@ This only moves existing overlays and never queries the filesystem."
                       :original-dir grease--root-dir))
           (setq grease--last-op-type 'file)
           (setq grease--last-kill-index 0))))
-     
+
      ;; Single line operation (yy/dd)
      ((let ((data (grease--get-line-data)))
         (when (and data (bolp))
@@ -1011,7 +1011,7 @@ This only moves existing overlays and never queries the filesystem."
           ;; Clear multi-selection data
           (setq grease--multi-line-selection nil)
           t)))
-     
+
      ;; Regular text operation
      (t
       (setq grease--last-op-type 'text)
@@ -1304,7 +1304,7 @@ Runs BEFORE Evil's delete (which will also yank)."
 (when (fboundp 'evil-yank)
   (advice-add 'evil-yank :after #'grease--on-evil-yank))
 
-;; Advice for delete operations  
+;; Advice for delete operations
 (when (fboundp 'evil-delete-line)
   (advice-add 'evil-delete-line :before #'grease--before-evil-delete))
 
@@ -1321,7 +1321,7 @@ Runs BEFORE Evil's delete (which will also yank)."
 ;; For regular Emacs operations that change the kill ring
 (advice-add 'kill-new :after
             (lambda (&rest _)
-              (unless (and (derived-mode-p 'grease-mode) 
+              (unless (and (derived-mode-p 'grease-mode)
                            (eq grease--last-op-type 'file))
                 (setq grease--last-op-type 'text)
                 (setq grease--last-kill-index nil))))
@@ -1361,7 +1361,7 @@ Runs BEFORE Evil's delete (which will also yank)."
               (lambda (&rest _)
                 ;; Update our index when user rotates through the kill ring
                 (when grease--last-kill-index
-                  (setq grease--last-kill-index 
+                  (setq grease--last-kill-index
                         (mod (1+ grease--last-kill-index) (length kill-ring)))))))
 
 ;; Evil ex-command for save
@@ -2881,11 +2881,11 @@ editing or discard all staged Grease-buffer changes."
                     :source-kinds (list (grease--line-data-source-kind data))
                     :original-dir grease--root-dir
                     :operation 'copy))
-        
+
         ;; Mark this as a file operation
         (setq grease--last-op-type 'file)
         (setq grease--last-kill-index 0)
-        
+
         (message "Copied file: %s" name)))))
 
 (defun grease-paste ()
