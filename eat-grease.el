@@ -37,7 +37,7 @@ Requires `eat' to be loaded."
           (when-let ((proc (eat-term-parameter
                             (bound-and-true-p eat-terminal)
                             'eat--process)))
-            (eat--send-string proc (format "cd %s\n" dir))
+            (eat--send-string proc (format "cd %s && clear\n" dir))
             (message "Grease: Sent cd to Eat for %s" dir))))
       (setq grease--origin-buffer nil))))
 
