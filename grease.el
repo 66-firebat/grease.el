@@ -3028,6 +3028,9 @@ editing or discard all staged Grease-buffer changes."
                                     (file-name-as-directory path)))
                       grease--directory-return-stack))
               (grease--render path t)
+              ;; Update default-directory so find-file/eat-exec/etc.
+              ;; use the new directory
+              (setq default-directory (file-name-as-directory path))
               ;; Restore cursor position, clamped to valid lines
               (grease--goto-line-clamped current-line))
           (grease--with-commit-prompt
