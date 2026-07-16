@@ -3387,5 +3387,97 @@ Each entry is a plist with `:path' and `:type'.  Directory entries use type
             (should suffix)
             (should (string-suffix-p (cdr spec) suffix))))))))
 
+;;;; grease-visit-alt Tests
+
+(ert-deftest grease-test-visit-alt-not-on-entry ()
+  "Error when not on a file or directory line."
+  (grease-test-with-temp-dir
+    (write-region "" nil (expand-file-name "file.txt" temp-dir))
+    (grease-test-with-buffer temp-dir
+      (goto-char (point-min))
+      (should-error (grease-visit-alt)
+                    :type 'user-error))))
+
+(ert-deftest grease-test-visit-alt-file-calls-callback ()
+  "Shift+Enter on a file calls the file callback with the full path."
+  (let ((called-path nil))
+    (grease-test-with-temp-dir
+      (write-region "hello" nil (expand-file-name "file.txt" temp-dir))
+      (grease-test-with-buffer temp-dir
+        (let ((grease-visit-alt-file-callback
+               (lambda (path) (setq called-path path))))
+          (grease-test-goto-entry "file.txt")
+          (grease-visit-alt)
+          (should (equal called-path
+                         (expand-file-name "file.txt" temp-dir))))))))
+
+(ert-deftest grease-test-visit-alt-file-keeps-buffer-open ()
+  "Visiting a file with Shift+Enter should keep the grease buffer alive."
+  (grease-test-with-temp-dir
+    (write-region "" nil (expand-file-name "file.txt" temp-dir))
+    (grease-test-with-buffer temp-dir
+      (let ((grease-visit-alt-file-callback (lambda (_) nil))
+            (buf (current-buffer)))
+        (grease-test-goto-entry "file.txt")
+        (grease-visit-alt)
+        (should (buffer-live-p buf))))))
+
+(ert-deftest grease-test-visit-alt-file-default-is-xdg-open ()
+  "Default file callback opens xdg-open asynchronously."
+  (grease-test-with-temp-dir
+    (write-region "" nil (expand-file-name "file.txt" temp-dir))
+    (grease-test-with-buffer temp-dir
+      (let* ((called-args nil)
+             (grease-visit-alt-file-callback
+              (lambda (path) (setq called-args (list "xdg-open" path)))))
+        (grease-test-goto-entry "file.txt")
+        (grease-visit-alt)
+        (should (equal (car called-args) "xdg-open"))
+        (should (equal (cadr called-args)
+                       (expand-file-name "file.txt" temp-dir)))))))
+
+(ert-deftest grease-test-visit-alt-directory-calls-callback ()
+  "Shift+Enter on a directory calls the directory callback."
+  (let ((called-dir nil))
+    (grease-test-with-temp-dir
+      (make-directory (expand-file-name "subdir" temp-dir))
+      (grease-test-with-buffer temp-dir
+        (let ((grease-visit-alt-directory-callback
+               (lambda (dir) (setq called-dir dir))))
+          (grease-test-goto-entry "subdir")
+          (grease-visit-alt)
+          (should (equal called-dir
+                         (expand-file-name "subdir" temp-dir))))))))
+
+(ert-deftest grease-test-visit-alt-directory-default-navigates ()
+  "Default directory callback renders the directory in-place."
+  (grease-test-with-temp-dir
+    (make-directory (expand-file-name "subdir" temp-dir))
+    (write-region "inside" nil (expand-file-name "subdir/inner.txt" temp-dir))
+    (grease-test-with-buffer temp-dir
+      (grease-test-goto-entry "subdir")
+      (grease-visit-alt)
+      (should (string-match-p "inner.txt" (buffer-string))))))
+
+(ert-deftest grease-test-visit-alt-file-callback-not-defined ()
+  "Error when file callback is nil."
+  (grease-test-with-temp-dir
+    (write-region "" nil (expand-file-name "file.txt" temp-dir))
+    (grease-test-with-buffer temp-dir
+      (let ((grease-visit-alt-file-callback nil))
+        (grease-test-goto-entry "file.txt")
+        (should-error (grease-visit-alt)
+                      :type 'user-error)))))
+
+(ert-deftest grease-test-visit-alt-directory-callback-not-defined ()
+  "Error when directory callback is nil."
+  (grease-test-with-temp-dir
+    (make-directory (expand-file-name "subdir" temp-dir))
+    (grease-test-with-buffer temp-dir
+      (let ((grease-visit-alt-directory-callback nil))
+        (grease-test-goto-entry "subdir")
+        (should-error (grease-visit-alt)
+                      :type 'user-error)))))
+
 (provide 'grease-test)
 ;;; grease-test.el ends here

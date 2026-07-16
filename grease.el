@@ -91,6 +91,21 @@ the same local/remote filesystem adapter."
   :type 'boolean
   :group 'grease)
 
+(defcustom grease-visit-alt-file-callback
+  (lambda (path) (start-process "xdg-open" nil "xdg-open" path))
+  "Callback for `grease-visit-alt' when visiting a file.
+Receives the full filesystem path as a single string argument."
+  :type 'function
+  :group 'grease)
+
+(defcustom grease-visit-alt-directory-callback
+  (lambda (dir) (grease--render dir t))
+  "Callback for `grease-visit-alt' when visiting a directory.
+Receives the full directory path as a single string argument.
+Default: navigates grease into that directory (same as RET)."
+  :type 'function
+  :group 'grease)
+
 ;;;; Sorting Configuration
 
 (defvar grease-sort-method 'type
@@ -3053,6 +3068,27 @@ editing or discard all staged Grease-buffer changes."
         (grease--render parent-dir t)
         (grease--goto-file child-name)))))
 
+(defun grease-visit-alt ()
+  "Visit file or directory at point with alternative callback.
+Files: opens with `grease-visit-alt-file-callback' (keeps grease buffer open).
+Directories: opens with `grease-visit-alt-directory-callback'.
+Grease buffer is NOT killed for either case."
+  (interactive)
+  (let ((data (grease--get-line-data)))
+    (if (not data)
+        (user-error "Not on a file or directory line.")
+      (let* ((name (plist-get data :name))
+             (type (plist-get data :type))
+             (path (grease--get-full-path name)))
+        (if (eq type 'dir)
+            (progn
+              (unless grease-visit-alt-directory-callback
+                (user-error "grease-visit-alt-directory-callback not defined"))
+              (funcall grease-visit-alt-directory-callback path))
+          (unless grease-visit-alt-file-callback
+            (user-error "grease-visit-alt-file-callback not defined"))
+          (funcall grease-visit-alt-file-callback path))))))
+
 (defun grease-refresh ()
   "Discard all changes and reload the directory from disk."
   (interactive)
@@ -3130,6 +3166,7 @@ editing or discard all staged Grease-buffer changes."
 (when (fboundp 'evil-define-key*)
   (evil-define-key* 'normal grease-mode-map
     (kbd "RET") #'grease-visit
+    (kbd "<S-return>") #'grease-visit-alt
     (kbd "-") #'grease-up-directory
     (kbd "g r") #'grease-refresh
     (kbd "g p") #'grease-toggle-preview
