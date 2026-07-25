@@ -300,7 +300,12 @@ having its score lowered."
 (defun greaszy-travel ()
   "Open a directory from zoxide, ranked by frecency with consult.
 Shows the frecency score to the left of each path.
-On selection, opens the directory in Grease via `grease-open'.
+On selection, opens the directory in Grease.
+
+If a Grease buffer already exists, it is reused — the buffer
+navigates to the selected directory in place rather than creating
+a new buffer.  If no Grease buffer exists, one is created via
+`grease-open'.
 
 Requires consult, embark, and vertico.  The `zoxide' binary must be
 on `exec-path'.  Signals `user-error' if any dependency is missing.
@@ -324,7 +329,17 @@ e.g. (global-set-key (kbd \"M-z\") #'greaszy-travel)."
                        (or (cdr (greaszy-parse-score-line selected))
                            selected))))))
     (when candidate
-      (grease-open candidate))
+      (if-let ((existing (cl-find-if (lambda (b)
+                                       (with-current-buffer b
+                                         (derived-mode-p 'grease-mode)))
+                                     (buffer-list))))
+          (progn
+            (switch-to-buffer existing)
+            (grease--render candidate)
+            (setq default-directory (file-name-as-directory candidate))
+            (goto-char (point-min))
+            (forward-line 1))
+        (grease-open candidate)))
     candidate))
 
 (provide 'greaszy)
